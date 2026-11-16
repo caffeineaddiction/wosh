@@ -2,16 +2,17 @@ package client
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/base64"
 	"errors"
-	"strconv"
-
-	"compress/gzip"
 	"fmt"
 	"io"
+	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"wosh/internal/build"
@@ -24,7 +25,9 @@ import (
 //
 // The remote command is a perl one-liner (perl ships with practically every
 // Linux distribution and with macOS). It reports the platform, receives a
-// gzipped wosh build for it over the same ssh stdin and executes it:
+// compressed wosh build for it over the same ssh stdin and executes it. The
+// build is xz-compressed when the remote has an `xz` command (and we have
+// the .xz cached), else gzipped (perl's IO::Uncompress::Gunzip), else raw:
 //
 //   - Linux: from a memfd (memfd_create), so it never touches a filesystem.
 //   - otherwise / memfd blocked: written to /dev/shm, $TMPDIR, /tmp or $HOME
@@ -43,19 +46,27 @@ import (
 // output>", then follows the client's decision (see decide):
 //
 //	USE <path>                 exec an installed wosh
-//	UPGRADE <path> <len>       replace it atomically with the payload, exec it
-//	MEM <len>                  run the payload without installing it
+//	UPGRADE <path> <len> <c>   replace it atomically with the payload, exec it
+//	MEM <len> <c>              run the payload without installing it
+//
+// The capability field is "1" if perl can gunzip ("0" if not), with "x"
+// appended if `xz` is on PATH; <c> is the payload's codec: x (xz, piped
+// through `xz -dc`), g (gzip) or r (raw).
 const pushStub = `$|=1;$o=$^O;$m=` + "`uname -m`" + `;chomp $m;` +
-	`$z=eval{require IO::Uncompress::Gunzip;1}?1:0;@f=();%s=();` +
+	`$z=eval{require IO::Uncompress::Gunzip;1}?1:0;@f=();%s=();$X="";` +
+	`for $c (split /:/,$ENV{PATH}){$X||="$c/xz" if -f "$c/xz" and -x "$c/xz"}$z.="x" if $X;` +
 	`for $c ((split /:/,$ENV{PATH}),"$ENV{HOME}/bin","$ENV{HOME}/.local/bin","$ENV{HOME}/go/bin"){` +
 	`$x="$c/wosh";next if $s{$x}++ or $x=~/[|\s]/;next unless -f $x and -x $x;` +
 	`$pv=` + "`\"$x\" _proto 2>/dev/null`" + `;chomp $pv;$pv=~s/[|\s]//g;$pv="-" unless length $pv;` +
 	`$w=(-w $x and -w $c)?1:0;push @f,"$x|$w|$pv"}` +
 	`print "WOSHPUSH $o $m $z @f\n";binmode STDIN;$l=<STDIN>;defined $l or exit 1;chomp $l;` +
-	`($q,$a,$l)=split / /,$l;if($q eq "USE"){exec {$a} "wosh",@ARGV;die "wosh: exec $a failed\n"}` +
-	`$l=$a if $q eq "MEM";` +
+	`($q,$a,$l,$c)=split / /,$l;if($q eq "USE"){exec {$a} "wosh",@ARGV;die "wosh: exec $a failed\n"}` +
+	`($l,$c)=($a,$l) if $q eq "MEM";` +
 	`$d="";while(length($d)<$l){$r=read(STDIN,$d,$l-length($d),length($d));$r or die "wosh push: short read\n"}` +
-	`if($z){$u="";IO::Uncompress::Gunzip::gunzip(\$d=>\$u) or die "wosh push: gunzip failed\n";$d=$u}` +
+	`if($c eq "x"){$p=open($h,"-|");defined $p or die "wosh push: fork: $^E\n";` +
+	`unless($p){open($k,"|-",$X,"-dc") or exit 1;binmode $k;print $k $d;close $k or exit 1;exit 0}` +
+	`binmode $h;{local $/;$d=<$h>}close $h or die "wosh push: xz failed\n"}` +
+	`elsif($c eq "g"){$u="";IO::Uncompress::Gunzip::gunzip(\$d=>\$u) or die "wosh push: gunzip failed\n";$d=$u}` +
 	`if($q eq "UPGRADE"){$t="$a.new.$$";if(open($h,">",$t)){binmode $h;print $h $d;close $h;chmod 0755,$t;` +
 	`if(rename $t,$a){print STDERR "wosh: upgraded $a\n";exec {$a} "wosh",@ARGV}unlink $t}}` +
 	`%n=(x86_64=>319,aarch64=>279);$nm="wosh";` +
@@ -120,11 +131,14 @@ func normPlatform(goos, arch string) (string, string) {
 }
 
 type localBuild struct {
-	path  string
-	stamp build.Stamp
-	once  sync.Once
-	z     []byte
-	err   error
+	path     string // "" for a build fetched from the wosh client
+	fetchKey string // set for a fetched build: platform key to fetch the .xz
+	stamp    build.Stamp
+	once     sync.Once
+	z        []byte
+	err      error
+	xzOnce   sync.Once
+	xzData   []byte
 }
 
 // gz returns the gzipped build: from the content-addressed cache
@@ -145,13 +159,78 @@ func (b *localBuild) gz() ([]byte, error) {
 	return b.z, b.err
 }
 
+// xz returns the xz-compressed build if it is ready (nil otherwise; then
+// gzip is used): from the cache, or fetched from the wosh client. A local
+// build missing from the cache is compressed in the background (xz takes
+// seconds) so the next upload can use it.
+func (b *localBuild) xz() []byte {
+	b.xzOnce.Do(func() {
+		if b.fetchKey != "" {
+			if fb, err := fetchBuild(b.fetchKey + ".xz"); err == nil && fb.stamp == b.stamp {
+				b.xzData = fb.z
+			}
+			return
+		}
+		cache := cachePath(b.stamp, ".xz")
+		if z, err := os.ReadFile(cache); err == nil && len(z) > 0 {
+			b.xzData = z
+			return
+		}
+		if cache != "" && b.path != "" {
+			go func() {
+				if z, err := xzFile(b.path); err == nil {
+					_ = writeAtomic(cache, z)
+				} else {
+					log.Printf("xz %s: %v", b.path, err)
+				}
+			}()
+		}
+	})
+	return b.xzData
+}
+
+// raw returns the uncompressed build.
+func (b *localBuild) raw() ([]byte, error) {
+	if b.path != "" {
+		return os.ReadFile(b.path)
+	}
+	z, err := b.gz()
+	if err != nil {
+		return nil, err
+	}
+	zr, err := gzip.NewReader(bytes.NewReader(z))
+	if err != nil {
+		return nil, err
+	}
+	return io.ReadAll(zr)
+}
+
 // GzCachePath is where the gzipped build with this stamp is cached.
-func GzCachePath(st build.Stamp) string {
+func GzCachePath(st build.Stamp) string { return cachePath(st, ".gz") }
+
+func cachePath(st build.Stamp, ext string) string {
 	dir, err := os.UserCacheDir()
 	if err != nil {
 		return ""
 	}
-	return filepath.Join(dir, "wosh", "gz", string(st)+".gz")
+	return filepath.Join(dir, "wosh", "gz", string(st)+ext)
+}
+
+// xzFile compresses with the xz command (much smaller than Go's xz
+// packages manage). CRC32 and no BCJ filter keep it decodable by any xz,
+// including busybox's.
+func xzFile(path string) ([]byte, error) {
+	xz, err := exec.LookPath("xz")
+	if err != nil {
+		return nil, err
+	}
+	var out, errb bytes.Buffer
+	cmd := exec.Command(xz, "-c", "-6", "-T1", "--check=crc32", path)
+	cmd.Stdout, cmd.Stderr = &out, &errb
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("%v: %s", err, strings.TrimSpace(errb.String()))
+	}
+	return out.Bytes(), nil
 }
 
 func compressFile(path string) ([]byte, error) {
@@ -177,25 +256,35 @@ func writeAtomic(path string, data []byte) error {
 	return os.Rename(tmp, path)
 }
 
-// Warm pre-compresses wosh binaries into the cache (`wosh _warm FILES...`).
+// Warm pre-compresses wosh binaries into the cache (`wosh _warm FILES...`):
+// gzip always, xz when the xz command is available.
 func Warm(paths ...string) error {
+	_, xzErr := exec.LookPath("xz")
+	if xzErr != nil {
+		fmt.Println("no xz command: caching gzip only")
+	}
 	for _, p := range paths {
 		st, err := build.Of(p)
 		if err != nil {
 			return fmt.Errorf("%s: %w", p, err)
 		}
-		dst := GzCachePath(st)
-		if _, err := os.Stat(dst); err == nil {
-			continue
+		for _, c := range []struct {
+			ext string
+			fn  func(string) ([]byte, error)
+		}{{".gz", compressFile}, {".xz", xzFile}} {
+			dst := cachePath(st, c.ext)
+			if _, err := os.Stat(dst); err == nil || (c.ext == ".xz" && xzErr != nil) {
+				continue
+			}
+			z, err := c.fn(p)
+			if err != nil {
+				return fmt.Errorf("%s: %w", p, err)
+			}
+			if err := writeAtomic(dst, z); err != nil {
+				return err
+			}
+			fmt.Printf("%s -> %s (%.1f MB)\n", p, dst, float64(len(z))/1e6)
 		}
-		z, err := compressFile(p)
-		if err != nil {
-			return err
-		}
-		if err := writeAtomic(dst, z); err != nil {
-			return err
-		}
-		fmt.Printf("%s -> %s (%.1f MB)\n", p, dst, float64(len(z))/1e6)
 	}
 	return nil
 }
@@ -239,6 +328,7 @@ func binaryFor(goos, arch string) (*localBuild, error) {
 	if stream.InSession() {
 		// chained hop: the wosh client upstream has the builds
 		if b, err := fetchBuild(key); err == nil {
+			b.fetchKey = key
 			binCache[key] = b
 			return b, nil
 		} else {
@@ -248,7 +338,9 @@ func binaryFor(goos, arch string) (*localBuild, error) {
 	return nil, fmt.Errorf("no wosh build for %s (looked for %s; run `make dist`)", key, strings.Join(cands, ", "))
 }
 
-// fetchBuild gets a gzipped build from the wosh client of this session.
+// fetchBuild gets a gzipped build ("<os>-<arch>"), or an xz-compressed one
+// ("<os>-<arch>.xz", an error if not ready), from the wosh client of this
+// session. Clients without xz support answer the .xz key with an error.
 func fetchBuild(key string) (*localBuild, error) {
 	s, err := stream.ToClient(wire.StreamSpec{K: "build", Cmd: key})
 	if err != nil {
@@ -276,12 +368,17 @@ func fetchBuild(key string) (*localBuild, error) {
 	}
 }
 
-// serveBuild sends a gzipped build to a chained hop that needs one.
+// serveBuild sends a build to a chained hop that needs one (see fetchBuild).
 func serveBuild(ch stream.Conn, key string) {
+	key, wantXZ := strings.CutSuffix(key, ".xz")
 	goos, arch, _ := strings.Cut(key, "-")
 	b, err := binaryFor(goos, arch)
 	var z []byte
-	if err == nil {
+	if err == nil && wantXZ {
+		if z = b.xz(); z == nil {
+			err = errors.New("no xz build ready")
+		}
+	} else if err == nil {
 		z, err = b.gz()
 	}
 	if err != nil {
@@ -375,7 +472,7 @@ func protoStr(p int) string {
 	return strconv.Itoa(p)
 }
 
-// answerStub handles the stub's "WOSHPUSH os arch gz [installed...]" line.
+// answerStub handles the stub's "WOSHPUSH os arch caps [installed...]" line.
 func answerStub(w io.Writer, line string, force bool) (decision, error) {
 	f := strings.Fields(line)
 	if len(f) < 4 {
@@ -393,21 +490,34 @@ func answerStub(w io.Writer, line string, force bool) (decision, error) {
 		_, err = fmt.Fprintf(w, "USE %s\n", d.path)
 		return d, err
 	}
-	var payload []byte
-	if f[3] == "1" {
-		if payload, err = ours.gz(); err != nil {
-			return d, err
-		}
-	} else if payload, err = os.ReadFile(ours.path); err != nil { // remote perl lacks Gunzip
+	codec, payload, err := choosePayload(ours, f[3])
+	if err != nil {
 		return d, err
 	}
+	d.why += fmt.Sprintf("; %s %.1f MB", map[string]string{"x": "xz", "g": "gzip", "r": "raw"}[codec], float64(len(payload))/1e6)
 	if d.verb == "UPGRADE" {
-		_, err = fmt.Fprintf(w, "UPGRADE %s %d\n", d.path, len(payload))
+		_, err = fmt.Fprintf(w, "UPGRADE %s %d %s\n", d.path, len(payload), codec)
 	} else {
-		_, err = fmt.Fprintf(w, "MEM %d\n", len(payload))
+		_, err = fmt.Fprintf(w, "MEM %d %s\n", len(payload), codec)
 	}
 	if err == nil {
 		_, err = w.Write(payload)
 	}
 	return d, err
+}
+
+// choosePayload picks the smallest encoding the remote can decode (caps:
+// "1" perl can gunzip, "x" xz on PATH): xz if ready, else gzip, else raw.
+func choosePayload(b *localBuild, caps string) (codec string, payload []byte, err error) {
+	if strings.Contains(caps, "x") {
+		if z := b.xz(); z != nil {
+			return "x", z, nil
+		}
+	}
+	if strings.HasPrefix(caps, "1") {
+		payload, err = b.gz()
+		return "g", payload, err
+	}
+	payload, err = b.raw()
+	return "r", payload, err
 }

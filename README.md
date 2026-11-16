@@ -54,8 +54,13 @@ protocol / commit time / binary hash). The client then decides:
    after start.
 
 Builds for other platforms come from `make dist` (`bin/dist/wosh-<os>-<arch>`;
-also `$WOSH_DIST`, `~/.cache/wosh`). Gzipped copies are cached by stamp in
-`~/.cache/wosh/gz/` (`wosh _warm FILES` / `make dist` pre-fills it).
+also `$WOSH_DIST`, `~/.cache/wosh`). Uploads are xz-compressed (~3.7 MB
+for linux-amd64) when the remote has an `xz` command, else gzipped
+(~4.8 MB, perl's built-in gunzip), else raw. Compressed copies are cached
+by stamp in `~/.cache/wosh/gz/` (`wosh _warm FILES` / `make dist`
+pre-fills both); xz needs the `xz` command on the client, and a build
+without a cached `.xz` is sent gzipped once while xz compresses it in the
+background.
 
 `--force-push` always runs from memory; `--no-push` (or `WOSH_PUSH=0`,
 or `--server-cmd=`) never uploads. Without remote perl, the client falls
