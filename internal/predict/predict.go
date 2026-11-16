@@ -1,21 +1,27 @@
 // Package predict implements mosh-style speculative local echo.
 //
 // A terminal emulator mirrors what the server has drawn, so we know the
-// cursor position and the contents of every cell. When the user types a
-// printable character we draw it at the predicted position right away
-// (underlined when latency is high) instead of waiting a round trip for
-// the remote echo. When server output arrives, predictions are first
+// cursor position and the contents (and width) of every cell. When the user
+// types a printable character we draw it at the predicted position right
+// away (underlined when latency is high) instead of waiting a round trip
+// for the remote echo. When server output arrives, predictions are first
 // erased (cells restored from the mirror), the output is passed through
 // untouched, and predictions that are still outstanding are drawn again.
 // A prediction is confirmed when the mirrored cell shows the predicted
-// character; if the server acknowledged the keystroke but the cell does
-// not match within a grace period, it was a misprediction: everything is
+// character; if the server acknowledged the keystroke but the cell does not
+// match within a grace period, it was a misprediction: everything is
 // withdrawn and prediction restarts tentatively.
 //
-// Like mosh, each "epoch" (a stretch of typing on one line) starts
-// tentative: nothing is shown until one of its predictions is confirmed by
-// the server. That keeps passwords (no echo) and full-screen apps that do
-// not echo from ever showing predicted text.
+// Like mosh, each "epoch" (a stretch of typing without cursor-moving keys)
+// starts tentative: nothing is shown until one of its predictions is
+// confirmed by the server. That keeps passwords and editor commands (vim
+// normal mode) from ever showing up as predicted text, while insert-mode
+// typing in vim/nano and shells is predicted after the first echo.
+//
+// Typing in the middle of a line is predicted as an insertion (the rest of
+// the line shifts right, as shells, vim and nano do). Predictions wrap to
+// the next row at the right margin (except on the bottom row, which would
+// scroll) and handle double-width characters.
 //
 // Unlike mosh, the real terminal still gets the raw output stream (so
 // scrollback works); predictions are drawn with relative cursor movement
@@ -25,13 +31,16 @@ package predict
 import (
 	"fmt"
 	"io"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
 	"unicode"
 	"unicode/utf8"
+	"unsafe"
 
-	"github.com/hinshun/vt10x"
+	uv "github.com/charmbracelet/ultraviolet"
+	"github.com/charmbracelet/x/vt"
 )
 
 // Mode selects when predictions are displayed.
@@ -61,28 +70,37 @@ var (
 	UnderlineAbove = 80 * time.Millisecond // flag predictions above this srtt
 )
 
+type pos struct{ x, y int }
+
 type pred struct {
-	col     int
-	r       rune
+	pos
+	s       string // grapheme
+	w       int    // cell width
 	off     uint64 // input stream offset just past this keystroke
 	ackedAt time.Time
+}
+
+// drawn remembers what is on the real terminal on top of the mirror.
+type drawn struct {
+	from   pos // first cell we overwrote
+	end    pos // cell after the last one we overwrote (may be x == cols)
+	cursor pos // where we left the real cursor
 }
 
 // Engine is the prediction state for the session on screen.
 type Engine struct {
 	mu   sync.Mutex
 	mode Mode
-	vt   vt10x.Terminal
+	vt   *vt.Emulator
 	cols int
+	rows int
 
 	srtt      time.Duration
 	connected bool
 
 	preds     []pred
-	row       int  // row of the current epoch
 	confirmed bool // epoch has had a prediction confirmed by the server
-	shown     int  // number of leading preds currently drawn
-	shownFrom int  // column of the first drawn prediction
+	shown     *drawn
 	ackedOff  uint64
 }
 
@@ -97,9 +115,13 @@ func (e *Engine) reset(cols, rows int) {
 	if cols <= 0 || rows <= 0 {
 		cols, rows = 80, 24
 	}
-	e.vt = vt10x.New(vt10x.WithSize(cols, rows), vt10x.WithWriter(io.Discard))
-	e.cols = cols
-	e.preds, e.shown, e.confirmed = nil, 0, false
+	if e.vt != nil {
+		_ = e.vt.Close()
+	}
+	e.vt = vt.NewEmulator(cols, rows)
+	go func(v *vt.Emulator) { _, _ = io.Copy(io.Discard, v) }(e.vt) // replies to queries
+	e.cols, e.rows = cols, rows
+	e.preds, e.shown, e.confirmed = nil, nil, false
 }
 
 // Reset forgets the screen (a different session is now shown); returns
@@ -117,9 +139,10 @@ func (e *Engine) Reset(cols, rows int) []byte {
 func (e *Engine) Resize(cols, rows int) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if cols > 0 && rows > 0 {
+	if cols > 0 && rows > 0 && (cols != e.cols || rows != e.rows) {
 		e.vt.Resize(cols, rows)
-		e.cols = cols
+		e.cols, e.rows = cols, rows
+		e.preds, e.shown, e.confirmed = nil, nil, false
 	}
 }
 
@@ -193,14 +216,14 @@ func (e *Engine) Tick() []byte {
 	if len(e.preds) == 0 {
 		return nil
 	}
-	before := len(e.preds)
-	var b strings.Builder
-	e.undraw(&b)
+	n := len(e.preds)
 	e.settle()
-	e.draw(&b)
-	if len(e.preds) == before && e.shown > 0 && b.Len() > 0 {
-		// nothing changed: avoid needless redraws
+	if len(e.preds) == n {
+		return nil // nothing changed: no redraw
 	}
+	var b strings.Builder
+	e.undrawStale(&b)
+	e.draw(&b)
 	return []byte(b.String())
 }
 
@@ -214,8 +237,8 @@ func (e *Engine) Input(p []byte, off uint64) []byte {
 	}
 	var b strings.Builder
 	e.undraw(&b)
-	cur := e.vt.Cursor()
-	altScreen := e.vt.Mode()&vt10x.ModeAltScreen != 0
+	cur := e.cursor()
+	width := e.vt.WidthMethod()
 	for len(p) > 0 {
 		r, n := utf8.DecodeRune(p)
 		p = p[n:]
@@ -227,21 +250,29 @@ func (e *Engine) Input(p []byte, off uint64) []byte {
 			} else {
 				e.endEpoch()
 			}
-		case r >= 0x20 && r != utf8.RuneError && unicode.IsPrint(r) && !isWide(r) && !altScreen:
-			col := cur.X
-			if len(e.preds) == 0 {
-				e.row = cur.Y
-			} else {
-				col = e.preds[len(e.preds)-1].col + 1
-			}
-			if e.row != cur.Y || col >= e.cols-1 {
-				e.endEpoch() // would wrap / cursor moved: stop guessing
+		case r >= 0x20 && r != utf8.RuneError && unicode.IsPrint(r):
+			s := string(r)
+			w := width.StringWidth(s)
+			if w < 1 || w > 2 {
+				e.endEpoch()
 				continue
 			}
-			e.preds = append(e.preds, pred{col: col, r: r, off: off})
-		default: // Enter, escape sequences, control keys: new epoch
+			at := cur.pos()
+			if len(e.preds) > 0 {
+				last := e.preds[len(e.preds)-1]
+				at = pos{last.x + last.w, last.y}
+			}
+			if at.x+w > e.cols { // wraps to the next row
+				if at.y >= e.rows-1 {
+					e.endEpoch() // bottom row would scroll: stop guessing
+					continue
+				}
+				at = pos{0, at.y + 1}
+			}
+			e.preds = append(e.preds, pred{pos: at, s: s, w: w, off: off})
+		default: // Enter, Tab, Esc, arrows, control keys: new epoch
 			e.endEpoch()
-			if r == 0x1b { // rest of an escape sequence: not printable input
+			if r == 0x1b { // rest of an escape sequence is not text
 				p = nil
 			}
 		}
@@ -250,26 +281,43 @@ func (e *Engine) Input(p []byte, off uint64) []byte {
 	return []byte(b.String())
 }
 
-func isWide(r rune) bool {
-	return r >= 0x1100 && (r <= 0x115f || r == 0x2329 || r == 0x232a ||
-		(r >= 0x2e80 && r <= 0xa4cf && r != 0x303f) || (r >= 0xac00 && r <= 0xd7a3) ||
-		(r >= 0xf900 && r <= 0xfaff) || (r >= 0xfe30 && r <= 0xfe6f) || (r >= 0xff00 && r <= 0xff60) ||
-		(r >= 0xffe0 && r <= 0xffe6) || r >= 0x1f300)
-}
-
 func (e *Engine) endEpoch() {
 	e.preds = nil
 	e.confirmed = false
 }
 
+type cursorPos struct{ x, y int }
+
+func (c cursorPos) pos() pos { return pos{c.x, c.y} }
+
+func (e *Engine) cursor() cursorPos {
+	p := e.vt.CursorPosition()
+	return cursorPos{p.X, p.Y}
+}
+
+func (e *Engine) cell(x, y int) (content string, width int, style uv.Style) {
+	c := e.vt.CellAt(x, y)
+	if c == nil {
+		return " ", 1, uv.Style{}
+	}
+	if c.Width == 0 && c.Content == "" {
+		return "", 0, c.Style // right half of a wide character
+	}
+	content = c.Content
+	if content == "" {
+		content = " "
+	}
+	return content, max(c.Width, 1), c.Style
+}
+
 // settle confirms or withdraws predictions against the mirrored screen.
 func (e *Engine) settle() {
-	cur := e.vt.Cursor()
 	grace := 250*time.Millisecond + 2*e.srtt
 	for len(e.preds) > 0 {
 		p := e.preds[0]
-		cell := e.vt.Cell(p.col, e.row)
-		if cell.Char == p.r {
+		// only judge keystrokes the server has received: text it drew on
+		// its own (fish autosuggestions, vim completion) must not count
+		if s, _, _ := e.cell(p.x, p.y); s == p.s && p.off <= e.ackedOff {
 			e.preds = e.preds[1:] // the server drew it: confirmed
 			e.confirmed = true
 			continue
@@ -280,8 +328,16 @@ func (e *Engine) settle() {
 		}
 		break
 	}
-	if len(e.preds) > 0 && cur.Y != e.row {
-		e.endEpoch() // the server moved to another line
+	if len(e.preds) > 0 {
+		cur := e.cursor()
+		first := e.preds[0]
+		if cur.y != first.y || cur.x > first.x {
+			// the server's cursor is somewhere our next prediction is not:
+			// it did something else with the keys (moved, scrolled, redrew)
+			if cur.y != first.y || !first.ackedAt.IsZero() {
+				e.endEpoch()
+			}
+		}
 	}
 }
 
@@ -297,104 +353,161 @@ func (e *Engine) visible() bool {
 
 // draw shows outstanding predictions; the real cursor ends after them.
 func (e *Engine) draw(b *strings.Builder) {
-	e.shown = 0
+	e.shown = nil
 	if len(e.preds) == 0 || !e.visible() {
 		return
 	}
-	cur := e.vt.Cursor()
-	if cur.Y != e.row {
+	cur := e.cursor()
+	first, last := e.preds[0], e.preds[len(e.preds)-1]
+	if cur.y != first.y || cur.x > first.x {
 		return
 	}
-	first := e.preds[0].col
-	moveCols(b, first-cur.X)
+	at := cur.pos()
+	at = e.move(b, at, first.pos)
+	style := "\x1b[0m"
 	if e.srtt > UnderlineAbove || !e.connected {
-		b.WriteString("\x1b[0;4m")
-	} else {
-		b.WriteString("\x1b[0m")
+		style = "\x1b[0;4m"
 	}
+	b.WriteString(style)
 	for _, p := range e.preds {
-		b.WriteRune(p.r)
+		if p.y != at.y { // wrapped: the terminal moves to the next row itself
+			at = pos{0, p.y}
+		}
+		b.WriteString(p.s)
+		at.x = p.x + p.w
 	}
 	b.WriteString("\x1b[0m")
-	e.shown, e.shownFrom = len(e.preds), first
+	end := pos{last.x + last.w, last.y}
+	d := &drawn{from: first.pos, end: end}
+	// insertion: if the predictions are on one row, shift the rest of the
+	// row right like the application will (never touching the last column,
+	// so the cursor never enters the terminal's pending-wrap state)
+	if s, _, _ := e.cell(first.x, first.y); s == first.s {
+		// the screen already shows what is being typed there (an
+		// autosuggestion, or retyping existing text): overwrite, no shift
+	} else if first.y == last.y && end.x < e.cols {
+		shift := end.x - first.x
+		var tail strings.Builder
+		x, tx := first.x, end.x
+		for x < e.cols && tx < e.cols-1 {
+			s, w, st := e.cell(x, first.y)
+			if w == 0 {
+				x++
+				continue
+			}
+			if tx+w > e.cols-1 {
+				break
+			}
+			tail.WriteString(sgr(st))
+			tail.WriteString(s)
+			x += w
+			tx += w
+		}
+		if tx > end.x && !e.blankFrom(first.x, first.y, e.cols-1-shift) {
+			b.WriteString(tail.String())
+			b.WriteString("\x1b[0m")
+			at = pos{tx, first.y}
+			d.end = at
+		}
+	}
+	d.cursor = e.move(b, at, end)
+	if end.x >= e.cols { // filled the row: cursor is parked at the margin
+		d.cursor = pos{e.cols - 1, end.y}
+	}
+	e.shown = d
+}
+
+// blankFrom reports whether row y holds only blanks from x up to limit.
+func (e *Engine) blankFrom(x, y, limit int) bool {
+	for ; x < e.cols && x <= limit; x++ {
+		if s, w, st := e.cell(x, y); w != 0 && (s != " " || !st.IsZero()) {
+			return false
+		}
+	}
+	return true
 }
 
 // undraw restores the cells under drawn predictions and puts the cursor
 // and pen back where the server left them.
 func (e *Engine) undraw(b *strings.Builder) {
-	if e.shown == 0 {
+	d := e.shown
+	if d == nil {
 		return
 	}
-	cur := e.vt.Cursor()
-	end := e.shownFrom + e.shown // real cursor column now
-	moveCols(b, e.shownFrom-end)
-	for c := e.shownFrom; c < end; c++ {
-		g := e.vt.Cell(c, e.row)
-		b.WriteString(sgr(g))
-		ch := g.Char
-		if ch == 0 || !unicode.IsPrint(ch) {
-			ch = ' '
+	e.shown = nil
+	at := e.move(b, d.cursor, d.from)
+	// rewrite the mirror's cells over the span we painted
+	y, x := d.from.y, d.from.x
+	if s, w, _ := e.cell(x, y); w == 0 && s == "" && x > 0 {
+		at = e.move(b, at, pos{x - 1, y}) // started on the right half of a wide char
+		x--
+	}
+	for y < d.end.y || (y == d.end.y && x < d.end.x) {
+		if x >= e.cols {
+			y, x = y+1, 0
+			at = e.move(b, pos{e.cols - 1, y - 1}, pos{0, y})
+			continue
 		}
-		b.WriteRune(ch)
+		s, w, st := e.cell(x, y)
+		if w == 0 {
+			x++
+			continue
+		}
+		b.WriteString(sgr(st))
+		b.WriteString(s)
+		x += w
+		at = pos{x, y}
 	}
-	moveCols(b, cur.X-end)
-	b.WriteString(sgr(cur.Attr))
-	e.shown = 0
+	b.WriteString("\x1b[0m")
+	if at.x >= e.cols {
+		at.x = e.cols - 1
+	}
+	e.move(b, at, e.cursor().pos())
+	b.WriteString(sgr(e.pen()))
 }
 
-func moveCols(b *strings.Builder, n int) {
-	switch {
-	case n > 0:
-		fmt.Fprintf(b, "\x1b[%dC", n)
-	case n < 0:
-		fmt.Fprintf(b, "\x1b[%dD", -n)
+// undrawStale: Tick path (no new output) - same as undraw.
+func (e *Engine) undrawStale(b *strings.Builder) { e.undraw(b) }
+
+// move emits relative cursor movement from 'from' to 'to'; returns 'to'.
+func (e *Engine) move(b *strings.Builder, from, to pos) pos {
+	if from.x >= e.cols {
+		from.x = e.cols - 1
 	}
+	switch dy := to.y - from.y; {
+	case dy > 0:
+		fmt.Fprintf(b, "\x1b[%dB", dy)
+	case dy < 0:
+		fmt.Fprintf(b, "\x1b[%dA", -dy)
+	}
+	switch dx := to.x - from.x; {
+	case dx > 0:
+		fmt.Fprintf(b, "\x1b[%dC", dx)
+	case dx < 0:
+		fmt.Fprintf(b, "\x1b[%dD", -dx)
+	}
+	return to
 }
 
-// vt10x attribute bits (unexported upstream).
-const (
-	attrReverse = 1 << iota
-	attrUnderline
-	attrBold
-	attrGfx
-	attrItalic
-	attrBlink
-)
-
-// sgr renders a glyph's attributes as an SGR sequence.
-func sgr(g vt10x.Glyph) string {
-	parts := []string{"0"}
-	if g.Mode&attrBold != 0 {
-		parts = append(parts, "1")
+// pen returns the style the server would draw the next character with.
+// The emulator keeps it unexported (Emulator.scr.cur.Pen); read it via
+// reflection. TestPenAccess guards this against library changes.
+func (e *Engine) pen() uv.Style {
+	defer func() { _ = recover() }()
+	scr := reflect.ValueOf(e.vt).Elem().FieldByName("scr")
+	if !scr.IsValid() || scr.IsNil() {
+		return uv.Style{}
 	}
-	if g.Mode&attrItalic != 0 {
-		parts = append(parts, "3")
+	f := scr.Elem().FieldByName("cur").FieldByName("Pen")
+	if !f.IsValid() {
+		return uv.Style{}
 	}
-	if g.Mode&attrUnderline != 0 {
-		parts = append(parts, "4")
-	}
-	if g.Mode&attrBlink != 0 {
-		parts = append(parts, "5")
-	}
-	if g.Mode&attrReverse != 0 {
-		parts = append(parts, "7")
-	}
-	parts = append(parts, color(g.FG, 30, 90, 38, vt10x.DefaultFG)...)
-	parts = append(parts, color(g.BG, 40, 100, 48, vt10x.DefaultBG)...)
-	return "\x1b[" + strings.Join(parts, ";") + "m"
+	return *(*uv.Style)(unsafe.Pointer(f.UnsafeAddr()))
 }
 
-func color(c vt10x.Color, base, bright, ext int, def vt10x.Color) []string {
-	switch {
-	case c == def || c >= 1<<24:
-		return nil
-	case c < 8:
-		return []string{fmt.Sprint(base + int(c))}
-	case c < 16:
-		return []string{fmt.Sprint(bright + int(c) - 8)}
-	case c < 256:
-		return []string{fmt.Sprint(ext), "5", fmt.Sprint(int(c))}
-	default:
-		return []string{fmt.Sprint(ext), "2", fmt.Sprint(int(c>>16) & 0xff), fmt.Sprint(int(c>>8) & 0xff), fmt.Sprint(int(c) & 0xff)}
+func sgr(s uv.Style) string {
+	if s.IsZero() {
+		return "\x1b[0m"
 	}
+	return "\x1b[0m" + s.String()
 }

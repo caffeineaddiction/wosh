@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"sync"
 	"time"
 
@@ -47,6 +48,7 @@ type Session struct {
 
 	streams       *stream.Registry
 	pings         map[uint64]time.Time
+	delayQ        chan delayed
 	srtt          time.Duration
 	connectedOnce bool
 	taLen         int // typeahead bytes at the front of inBuf (not yet connected)
@@ -165,7 +167,7 @@ func (s *Session) negotiate(w sigChan) error {
 	}
 	opened := make(chan struct{})
 	dc.OnOpen(func() { close(opened) })
-	dc.OnMessage(func(m webrtc.DataChannelMessage) { s.onFrame(gen, m.Data) })
+	dc.OnMessage(func(m webrtc.DataChannelMessage) { s.deliver(gen, m.Data) })
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
 		if c != nil {
 			log.Printf("[%s] gen %d local candidate %s", s.id, gen, c.String())
@@ -668,4 +670,34 @@ func (s *Session) prependInput(b []byte) {
 	}
 	s.mu.Unlock()
 	s.sendInput(b)
+}
+
+// simDelay (WOSH_SIM_DELAY, debugging) delays everything received from the
+// remote side, in order, to try high-latency behaviour on a fast link.
+var simDelay, _ = time.ParseDuration(os.Getenv("WOSH_SIM_DELAY"))
+
+type delayed struct {
+	at   time.Time
+	gen  int
+	data []byte
+}
+
+func (s *Session) deliver(gen int, data []byte) {
+	if simDelay <= 0 {
+		s.onFrame(gen, data)
+		return
+	}
+	s.mu.Lock()
+	if s.delayQ == nil {
+		s.delayQ = make(chan delayed, 4096)
+		go func(q chan delayed) {
+			for d := range q {
+				time.Sleep(time.Until(d.at))
+				s.onFrame(d.gen, d.data)
+			}
+		}(s.delayQ)
+	}
+	q := s.delayQ
+	s.mu.Unlock()
+	q <- delayed{at: time.Now().Add(simDelay), gen: gen, data: append([]byte(nil), data...)}
 }

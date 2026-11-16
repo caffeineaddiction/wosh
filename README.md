@@ -87,13 +87,19 @@ technique and may be flagged by EDR; `vm.memfd_noexec=2` disables it.
 ## Typing on slow links (predictive echo)
 
 Like mosh, wosh echoes what you type locally before the server confirms
-it. A terminal emulator mirrors the remote screen, so printable keys (and
-backspace) are drawn at the predicted cursor position immediately -
-underlined while the round trip is > 80 ms or the link is down - and
-reconciled when the server's echo arrives: matching cells confirm the
-prediction, anything else withdraws it. Each line starts tentative: nothing
-is predicted until the server has echoed one keystroke of it, so password
-prompts and non-echoing programs never show predicted text.
+it. A terminal emulator mirrors the remote screen (cells, widths, cursor),
+so printable keys and backspace are drawn at the predicted position
+immediately - underlined while the round trip is > 80 ms or the link is
+down - and reconciled when the server's echo arrives: a prediction is
+confirmed only when the server has received that keystroke and drawn the
+same character there, anything else withdraws it. Each stretch of typing
+starts tentative (nothing shown until the server echoes one key of it), so
+password prompts and editor commands (vim normal mode) never show
+predicted text, while typing in shells, vim insert mode and nano does.
+Typing mid-line is predicted as an insertion (the rest of the line shifts
+right), predictions wrap at the right margin (not on the bottom row, which
+would scroll) and handle double-width characters (CJK, emoji). Text a
+shell draws by itself (fish autosuggestions) never confirms a prediction.
 
 `--predict=adaptive` (default: when the smoothed round trip is > 30 ms or
 the link is down), `always`, `never`; env `WOSH_PREDICT`. Unlike mosh, the
@@ -160,7 +166,9 @@ pair that then dies). wosh handles this:
 * before answering, a macOS daemon probes the client's on-link candidates
   and drops the ones it cannot send to, so ICE picks a working path.
 
-Debugging: `WOSH_DEBUG=1` (verbose pion logs), `WOSH_ICE_NET=udp4|udp6`
+Debugging: `WOSH_SIM_DELAY=250ms` (client delays everything it receives,
+to try high-latency behaviour such as prediction on a fast link),
+`WOSH_DEBUG=1` (verbose pion logs), `WOSH_ICE_NET=udp4|udp6`
 (restrict candidates), `WOSH_KEEP_LOGS=1` (keep daemon logs); `~s` shows
 the selected candidate pair.
 
@@ -180,8 +188,8 @@ the selected candidate pair.
 * Reconnecting the root needs non-interactive ssh auth (keys/agent).
 * Hops reached with plain ssh still need `wosh up` and an installed wosh;
   use `wosh host` from inside a session instead (chained hop).
-* Prediction covers printable keys and backspace on the current line (no
-  wide characters, line wrap or alternate-screen apps yet).
+* Prediction covers printable keys and backspace; cursor keys, Enter and
+  other control keys start a new (tentative) stretch.
 * A chained hop ends the intermediate host's forwarded connections (by
   design); new connections go to the new destination.
 * tmux/screen on an intermediate hop swallow unknown OSC (use passthrough).

@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hinshun/vt10x"
+	"github.com/charmbracelet/x/vt"
 
 	"wosh/internal/predict"
 	"wosh/internal/wire"
@@ -18,7 +18,7 @@ import (
 
 type vtWriter struct {
 	mu sync.Mutex
-	vt vt10x.Terminal
+	vt *vt.Emulator
 }
 
 func (w *vtWriter) Write(p []byte) (int, error) {
@@ -30,7 +30,18 @@ func (w *vtWriter) Write(p []byte) (int, error) {
 func (w *vtWriter) screen() string {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.vt.String()
+	var b strings.Builder
+	for y := 0; y < w.vt.Height(); y++ {
+		for x := 0; x < w.vt.Width(); x++ {
+			if c := w.vt.CellAt(x, y); c != nil && c.Content != "" {
+				b.WriteString(c.Content)
+			} else if c != nil && c.Width != 0 {
+				b.WriteByte(' ')
+			}
+		}
+		b.WriteByte('\n')
+	}
+	return b.String()
 }
 
 // TestPredictionEndToEnd: with prediction forced on, what the user's
@@ -54,7 +65,9 @@ func TestPredictionEndToEnd(t *testing.T) {
 	t.Setenv("HOME", tmp)
 	_ = os.WriteFile(filepath.Join(tmp, ".profile"), nil, 0o644)
 
-	screen := &vtWriter{vt: vt10x.New(vt10x.WithSize(80, 24), vt10x.WithWriter(io.Discard))}
+	emu := vt.NewEmulator(80, 24)
+	go func() { _, _ = io.Copy(io.Discard, emu) }()
+	screen := &vtWriter{vt: emu}
 	inR, inW := io.Pipe()
 	c, err := Start(Options{Local: bin, In: inR, Out: screen, Err: io.Discard, ICE: []wire.ICEServer{},
 		Term: "xterm", Predict: predict.Always})
@@ -84,13 +97,15 @@ func TestPredictionEndToEnd(t *testing.T) {
 	waitScreen("\npredicted-text")
 	slowType("echo abcdef\x7f\x7fXY\r") // with backspaces
 	waitScreen("\nabcdXY")
+	slowType("echo 日本語 wide\r")
+	waitScreen("\n日本語 wide")
 	time.Sleep(300 * time.Millisecond)
 	var lines []string
 	for _, l := range strings.Split(screen.screen(), "\n") {
 		lines = append(lines, strings.TrimRight(l, " "))
 	}
 	got := strings.Join(lines, "\n")
-	for _, want := range []string{"$ echo predicted-text\n", "$ echo abcdXY\n"} {
+	for _, want := range []string{"$ echo predicted-text\n", "$ echo abcdXY\n", "$ echo 日本語 wide\n"} {
 		if strings.Count(got, want) != 1 {
 			t.Fatalf("expected exactly one %q on screen:\n%s", want, got)
 		}
