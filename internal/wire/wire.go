@@ -84,6 +84,15 @@ type Msg struct {
 	Agent  bool              `json:"agent,omitempty"`  // offer: forward the client's ssh-agent
 	Stream *StreamSpec       `json:"stream,omitempty"` // control socket: open a stream to the client
 	Text   string            `json:"text,omitempty"`   // control socket: input for TType
+
+	// Shared sessions. A client that sets CID (stable for one client instance,
+	// across its reconnects) supports roles: several such peers may watch one
+	// session while one of them controls it (input, resize, kill, forwards).
+	// Without Join the offer takes control; with Join it only takes control if
+	// nobody else has it, else it watches. A peer without a CID always takes
+	// control, and the peer it replaces is dropped (the original behaviour).
+	CID  string `json:"cid,omitempty"`  // offer: client instance id
+	Join bool   `json:"join,omitempty"` // offer: watch if another client has control
 }
 
 // StreamSpec describes an extra data channel (port forward, file transfer).

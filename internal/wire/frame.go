@@ -81,7 +81,8 @@ func ParseExit(b []byte) int {
 
 // Control is a JSON control message on the main channel.
 type Control struct {
-	Op    string      `json:"op"`              // info (S->C), rfwd (C->S)
+	Op    string      `json:"op"`              // info, role (S->C); rfwd, take (C->S)
+	Role  string      `json:"role,omitempty"`  // role: "control" or "view" (peers with a CID)
 	Token string      `json:"token,omitempty"` // info: session token for chained hops
 	Rfwd  []RemoteFwd `json:"rfwd,omitempty"`  // rfwd: remote forwards to listen on
 }

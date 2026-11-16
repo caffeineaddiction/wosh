@@ -85,6 +85,15 @@ technique and may be flagged by EDR; `vm.memfd_noexec=2` disables it.
 * **Client** (`internal/client`): a stack of sessions; keyboard goes to the
   top. Output and input carry stream offsets; unacknowledged input is
   resent and missed output replayed after reconnect, so nothing is lost.
+* **Shared sessions**: a client that sends a client id (`cid`, stable across
+  its reconnects) can share a session with other such clients. One of them
+  controls it (input, resize, kill, forwards); the others watch the same
+  output. An offer with `join` only takes control if nobody has it; a
+  watcher asks for control with a `{"op":"take"}` control frame, and the
+  daemon tells each peer its role (`{"op":"role","role":"control"|"view"}`).
+  When the controller is gone for 10 s, the longest watcher gets control.
+  A client without a cid (the `wosh` CLI) always takes control and the peer
+  it replaces is dropped, as before.
 * **Roaming**: 1 s pings (6 s timeout), ICE failure, or a local address
   disappearing trigger reconnect. Root sessions re-run ssh (`BatchMode`) with
   `attach`; nested sessions wait for their parent, then signal through it.

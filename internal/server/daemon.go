@@ -57,7 +57,10 @@ type Daemon struct {
 	cmd      *exec.Cmd
 	out      *ring
 	inRx     uint64
-	cur      *peer
+	peers    map[*peer]bool // open or opening peers
+	ctrl     *peer          // the peer in control (input, resize, kill, forwards)
+	ctrlGone time.Time      // when the controller went away (viewers get promoted later)
+	joined   uint64         // peer join counter (oldest viewer is promoted first)
 	started  bool
 	exited   bool
 	exitCode int
@@ -93,7 +96,13 @@ type peer struct {
 	exitOut bool
 	echoOut uint64 // last echo ack sent to this peer
 	low     chan struct{}
+	cid     string // client instance (supports roles); "" = legacy, single peer
+	seq     uint64 // join order
 }
+
+// promoteAfter: when the controller is gone this long (and did not reconnect,
+// e.g. after roaming), the longest-watching viewer gets control.
+const promoteAfter = 10 * time.Second
 
 // RunDaemon runs a session daemon until the session ends.
 func RunDaemon(opts DaemonOptions) error {
@@ -119,6 +128,7 @@ func RunDaemon(opts DaemonOptions) error {
 		quit:    make(chan struct{}),
 		ln:      ln,
 		conns:   map[net.Conn]chan struct{}{},
+		peers:   map[*peer]bool{},
 		token:   newToken(),
 		rfwd:    map[int]net.Listener{},
 		streams: stream.NewRegistry(),
@@ -149,8 +159,8 @@ func RunDaemon(opts DaemonOptions) error {
 	<-d.quit
 	_ = ln.Close()
 	d.mu.Lock()
-	if d.cur != nil {
-		_ = d.cur.pc.Close()
+	for p := range d.peers {
+		_ = p.pc.Close()
 	}
 	d.mu.Unlock()
 	for _, l := range d.rfwd {
@@ -191,7 +201,8 @@ func (d *Daemon) watchdog() {
 		}
 		d.mu.Lock()
 		started, exited, acked := d.started, d.exited, d.exitAck
-		delivered, connected := d.exitDelivered, d.cur != nil && d.cur.open
+		delivered, connected := d.exitDelivered, d.anyOpenLocked()
+		d.promoteLocked()
 		d.mu.Unlock()
 		if delivered && !connected {
 			if orphanSince.IsZero() {
@@ -343,10 +354,15 @@ func (d *Daemon) serveConn(c net.Conn) {
 		// the goodbye still gets through, so the client reconnects at once
 		// (and the new offer is probed) instead of waiting for a timeout.
 		d.mu.Lock()
-		p := d.cur
+		var ps []*peer
+		for p := range d.peers {
+			ps = append(ps, p)
+		}
 		d.mu.Unlock()
-		if p != nil {
-			log.Printf("anchor ssh closed: dropping peer so the client renegotiates")
+		if len(ps) > 0 {
+			log.Printf("anchor ssh closed: dropping peers so clients renegotiate")
+		}
+		for _, p := range ps {
 			_ = p.pc.Close()
 		}
 	}
@@ -462,28 +478,41 @@ func (d *Daemon) sender() {
 	}
 }
 
-// sendSome sends one chunk; returns true if more may be pending.
+// sendSome sends one chunk to every peer that can take it; returns true if
+// more may be pending. A slow peer is skipped (its low-water callback pokes
+// the sender), so it cannot hold up the others.
 func (d *Daemon) sendSome() bool {
 	d.mu.Lock()
-	p := d.cur
-	if p == nil || !p.open {
-		d.mu.Unlock()
+	var ps []*peer
+	for p := range d.peers {
+		if p.open {
+			ps = append(ps, p)
+		}
+	}
+	d.mu.Unlock()
+	more := false
+	for _, p := range ps {
+		if d.sendTo(p) {
+			more = true
+		}
+	}
+	return more
+}
+
+func (d *Daemon) sendTo(p *peer) bool {
+	if p.dc.BufferedAmount() > maxBuffered {
 		return false
 	}
-	if p.dc.BufferedAmount() > maxBuffered {
+	d.mu.Lock()
+	if !p.open {
 		d.mu.Unlock()
-		select {
-		case <-p.low:
-		case <-time.After(time.Second):
-		case <-d.quit:
-		}
-		return true
+		return false
 	}
 	data, off := d.out.slice(p.sent, wire.MaxChunk)
 	if len(data) == 0 {
 		// output is caught up: report which input the app has had time to
 		// answer (mosh's echo ack) so the client can judge its predictions
-		if echo := d.echoAckLocked(); echo > p.echoOut {
+		if echo := d.echoAckLocked(); echo > p.echoOut && p == d.ctrl {
 			p.echoOut = echo
 			d.mu.Unlock()
 			_ = p.dc.Send(wire.U64Frame(wire.FEchoAck, echo))
@@ -510,6 +539,85 @@ func (d *Daemon) sendSome() bool {
 		return false
 	}
 	return true
+}
+
+// --- roles ------------------------------------------------------------------
+
+func (d *Daemon) anyOpenLocked() bool {
+	for p := range d.peers {
+		if p.open {
+			return true
+		}
+	}
+	return false
+}
+
+// setCtrlLocked gives p control. The previous controller is told it now
+// watches; a legacy one (no CID) is dropped instead, as before roles.
+func (d *Daemon) setCtrlLocked(p *peer) {
+	old := d.ctrl
+	d.ctrl = p
+	d.ctrlGone = time.Time{}
+	if old == nil || old == p {
+		return
+	}
+	if old.cid == "" {
+		delete(d.peers, old)
+		old.open = false
+		go old.pc.Close()
+		return
+	}
+	go d.sendRole(old, "view")
+}
+
+func (d *Daemon) sendRole(p *peer, role string) {
+	if p.cid == "" || p.dc == nil {
+		return
+	}
+	_ = p.dc.Send(wire.ControlFrame(wire.Control{Op: "role", Role: role}))
+	if role == "control" {
+		// the input offset the new controller must continue from
+		_ = p.dc.Send(wire.U64Frame(wire.FAck, d.inputRx()))
+	}
+}
+
+// take gives control to p (a viewer that asked for it).
+func (d *Daemon) take(p *peer) {
+	d.mu.Lock()
+	if !p.open || p.cid == "" || d.ctrl == p {
+		d.mu.Unlock()
+		return
+	}
+	d.setCtrlLocked(p)
+	d.mu.Unlock()
+	log.Printf("control taken by %s", p.cid)
+	d.sendRole(p, "control")
+}
+
+// promoteLocked hands control to the longest-watching viewer once the
+// controller has been gone for promoteAfter.
+func (d *Daemon) promoteLocked() {
+	if d.ctrl != nil || d.ctrlGone.IsZero() || time.Since(d.ctrlGone) < promoteAfter {
+		return
+	}
+	var best *peer
+	for p := range d.peers {
+		if p.open && p.cid != "" && (best == nil || p.seq < best.seq) {
+			best = p
+		}
+	}
+	if best == nil {
+		return
+	}
+	d.setCtrlLocked(best)
+	log.Printf("controller gone: control passed to %s", best.cid)
+	go d.sendRole(best, "control")
+}
+
+func (d *Daemon) isCtrl(p *peer) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.ctrl == p
 }
 
 func (d *Daemon) handleOffer(m wire.Msg) (wire.Msg, error) {
@@ -541,7 +649,8 @@ func (d *Daemon) handleOffer(m wire.Msg) (wire.Msg, error) {
 	if err != nil {
 		return wire.Msg{}, err
 	}
-	p := &peer{pc: pc, sent: m.RxOut, low: make(chan struct{}, 1)}
+	p := &peer{pc: pc, sent: m.RxOut, low: make(chan struct{}, 1), cid: m.CID}
+	join := m.Join && m.CID != ""
 
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
 		if spec, ok := stream.ParseLabel(dc.Label()); ok {
@@ -561,21 +670,42 @@ func (d *Daemon) handleOffer(m wire.Msg) (wire.Msg, error) {
 			case p.low <- struct{}{}:
 			default:
 			}
+			d.poke()
 		})
 		dc.OnOpen(func() {
 			d.mu.Lock()
-			old := d.cur
-			d.cur = p
+			// an earlier connection of the same client is stale (it roamed)
+			sameAsCtrl := false
+			for q := range d.peers {
+				if q != p && q.cid != "" && q.cid == p.cid {
+					if q == d.ctrl {
+						sameAsCtrl = true
+						d.ctrl = nil
+					}
+					delete(d.peers, q)
+					q.open = false
+					go q.pc.Close()
+				}
+			}
+			hadCtrl := d.ctrl != nil
+			d.joined++
+			p.seq = d.joined
+			d.peers[p] = true
 			p.open = true
 			d.everOpen = true
-			d.mu.Unlock()
-			if old != nil && old != p {
-				go old.pc.Close()
+			control := !join || sameAsCtrl || d.ctrl == nil
+			if control {
+				d.setCtrlLocked(p)
 			}
-			log.Printf("peer connected")
+			d.mu.Unlock()
+			role := map[bool]string{true: "control", false: "view"}[control]
+			log.Printf("peer connected (%s%s)", role, map[bool]string{true: ", " + p.cid, false: ""}[p.cid != ""])
 			_ = dc.Send(wire.U64Frame(wire.FAck, d.inputRx()))
 			_ = dc.Send(wire.ControlFrame(wire.Control{Op: "info", Token: d.token}))
-			if old != nil && old != p {
+			if p.cid != "" {
+				_ = dc.Send(wire.ControlFrame(wire.Control{Op: "role", Role: role}))
+			}
+			if control && (hadCtrl || sameAsCtrl) {
 				// streams we opened (-R, src:, agent) continue on the new link
 				d.streams.ReopenAll(pc)
 			}
@@ -587,8 +717,13 @@ func (d *Daemon) handleOffer(m wire.Msg) (wire.Msg, error) {
 		log.Printf("peer state %s", s)
 		if s == webrtc.PeerConnectionStateFailed || s == webrtc.PeerConnectionStateClosed {
 			d.mu.Lock()
-			if d.cur == p {
-				p.open = false
+			p.open = false
+			if d.peers[p] {
+				delete(d.peers, p)
+				if d.ctrl == p {
+					d.ctrl = nil
+					d.ctrlGone = time.Now()
+				}
 			}
 			d.mu.Unlock()
 			if s == webrtc.PeerConnectionStateFailed {
@@ -631,6 +766,12 @@ func (d *Daemon) inputRx() uint64 {
 func (d *Daemon) onFrame(p *peer, b []byte) {
 	if len(b) == 0 {
 		return
+	}
+	switch b[0] {
+	case wire.FInput, wire.FResize, wire.FKill:
+		if !d.isCtrl(p) {
+			return // viewers watch; only the controller types, resizes or kills
+		}
 	}
 	switch b[0] {
 	case wire.FInput:
@@ -687,8 +828,13 @@ func (d *Daemon) onFrame(p *peer, b []byte) {
 		d.exitAck = true
 		d.mu.Unlock()
 	case wire.FControl:
-		if c, ok := wire.ParseControl(b); ok && c.Op == "rfwd" {
+		c, ok := wire.ParseControl(b)
+		switch {
+		case !ok:
+		case c.Op == "rfwd" && d.isCtrl(p):
 			d.listenRemote(c.Rfwd)
+		case c.Op == "take":
+			d.take(p)
 		}
 	case wire.FKill:
 		d.mu.Lock()
@@ -712,7 +858,7 @@ func (d *Daemon) openToClient(spec wire.StreamSpec) (*stream.Resumable, error) {
 	deadline := time.Now().Add(20 * time.Second)
 	for {
 		d.mu.Lock()
-		p := d.cur
+		p := d.ctrl
 		d.mu.Unlock()
 		if p != nil && p.open {
 			r, err := stream.OpenResumable(p.pc, spec)
