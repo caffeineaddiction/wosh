@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -44,7 +45,6 @@ type DaemonOptions struct {
 // Daemon owns one PTY session and serves WebRTC peers for it.
 type Daemon struct {
 	opts DaemonOptions
-	api  *webrtc.API
 
 	mu       sync.Mutex
 	key      string
@@ -98,7 +98,6 @@ func RunDaemon(opts DaemonOptions) error {
 
 	d := &Daemon{
 		opts:  opts,
-		api:   rtc.NewAPI(),
 		out:   newRing(ringSize),
 		kick:  make(chan struct{}, 1),
 		quit:  make(chan struct{}),
@@ -233,6 +232,7 @@ func (d *Daemon) serveConn(c net.Conn) {
 	sc := bufio.NewScanner(c)
 	sc.Buffer(make([]byte, 64*1024), 1<<20)
 	enc := json.NewEncoder(c)
+	anchored := false
 	for sc.Scan() {
 		var m wire.Msg
 		if err := json.Unmarshal(sc.Bytes(), &m); err != nil {
@@ -255,6 +255,24 @@ func (d *Daemon) serveConn(c net.Conn) {
 			if !started {
 				d.stop()
 			}
+		case wire.TPark:
+			anchored = true
+		}
+	}
+	d.mu.Lock()
+	exited := d.exited
+	d.mu.Unlock()
+	if anchored && runtime.GOOS == "darwin" && !exited {
+		// The ssh session that launched us is gone. macOS will block our LAN
+		// sends within ~1s (Local Network privacy); close the peer now while
+		// the goodbye still gets through, so the client reconnects at once
+		// (and the new offer is probed) instead of waiting for a timeout.
+		d.mu.Lock()
+		p := d.cur
+		d.mu.Unlock()
+		if p != nil {
+			log.Printf("anchor ssh closed: dropping peer so the client renegotiates")
+			_ = p.pc.Close()
 		}
 	}
 }
@@ -426,7 +444,7 @@ func (d *Daemon) handleOffer(m wire.Msg) (wire.Msg, error) {
 	}
 	d.mu.Unlock()
 
-	pc, err := d.api.NewPeerConnection(rtc.Config(m.ICE, m.Relay))
+	pc, err := rtc.NewAPI().NewPeerConnection(rtc.Config(m.ICE, m.Relay))
 	if err != nil {
 		return wire.Msg{}, err
 	}
@@ -474,7 +492,13 @@ func (d *Daemon) handleOffer(m wire.Msg) (wire.Msg, error) {
 		}
 	})
 
-	if err := pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: m.SDP}); err != nil {
+	offerSDP := m.SDP
+	if runtime.GOOS == "darwin" && !m.Anchor {
+		// (an offer relayed by the ssh session that launched us needs no
+		// probe: LAN sends are allowed while that session exists)
+		offerSDP = rtc.DropUnreachableCandidates(offerSDP)
+	}
+	if err := pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: offerSDP}); err != nil {
 		pc.Close()
 		return wire.Msg{}, err
 	}

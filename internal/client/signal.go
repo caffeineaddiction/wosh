@@ -26,11 +26,12 @@ type sigChan interface {
 // --- ssh / local process pipe ------------------------------------------------
 
 type pipeWire struct {
-	cmd     *exec.Cmd
-	stdin   io.WriteCloser
-	msgs    chan wire.Msg
-	once    sync.Once
-	pushErr atomic.Value // error: push handshake happened but no build could be sent
+	cmd      *exec.Cmd
+	stdin    io.WriteCloser
+	msgs     chan wire.Msg
+	once     sync.Once
+	pushErr  atomic.Value // error: push handshake happened but no build could be sent
+	decision decision     // what the stub was told to run
 }
 
 // exitCode of the ssh process (valid after close).
@@ -120,7 +121,10 @@ func (c *Client) startPipe(pc pipeCmd) (*pipeWire, error) {
 						pushing = false
 						log.Printf("push handshake: %s", line)
 						go func() {
-							if err := sendBinary(stdin, line); err != nil {
+							d, err := answerStub(stdin, line, c.o.ForcePush)
+							log.Printf("remote start: %s %s (%s)", d.verb, d.path, d.why)
+							w.decision = d
+							if err != nil {
 								w.pushErr.Store(err)
 								_ = stdin.Close()
 							}
@@ -214,7 +218,7 @@ func (w *parentWire) close() { w.parent.removeWaiter(w.id) }
 
 // remotePath is appended to PATH on the remote side so a wosh installed in a
 // user directory is found by non-interactive ssh commands.
-const remotePath = `$PATH:$HOME/.local/bin:$HOME/go/bin:/usr/local/bin`
+const remotePath = `$PATH:$HOME/bin:$HOME/.local/bin:$HOME/go/bin:/usr/local/bin`
 
 // RemoteCommand builds the command string ssh hands to the remote user's
 // login shell (`$SHELL -c <string>`). That shell may be bash, zsh, fish,

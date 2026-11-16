@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -24,7 +25,8 @@ import (
 type RelayMode int
 
 const (
-	// ModeServer starts a new daemon, relays the first negotiation and exits.
+	// ModeServer starts a new daemon, relays the first negotiation and stays
+	// until stdin closes (the client decides how long to keep ssh open).
 	// Used as the remote command of `ssh -T host wosh server`.
 	ModeServer RelayMode = iota
 	// ModeUp starts a new daemon and stays in the foreground ("parked") so
@@ -97,7 +99,7 @@ func RunRelay(o RelayOptions) error {
 	if u, err := user.Current(); err == nil {
 		uname = u.Username
 	}
-	if _, err := o.Out.Write(wire.EncodeOSC(wire.Msg{T: wire.THello, ID: id, Host: host, User: uname, Sock: sock})); err != nil {
+	if _, err := o.Out.Write(wire.EncodeOSC(wire.Msg{T: wire.THello, ID: id, Host: host, User: uname, Sock: sock, OS: runtime.GOOS})); err != nil {
 		return err
 	}
 
@@ -174,6 +176,7 @@ func RunRelay(o RelayOptions) error {
 				if ev.m.ID != "" && ev.m.ID != id {
 					continue // meant for another session
 				}
+				ev.m.Anchor = o.Mode == ModeServer && !connected
 				if err := enc.Encode(ev.m); err != nil {
 					return err
 				}
@@ -194,9 +197,14 @@ func RunRelay(o RelayOptions) error {
 				if ans.T == wire.TAnswer {
 					connected = true
 					firstWait = nil
-					if o.Mode != ModeUp {
+					if o.Mode == ModeAttach {
 						return nil
 					}
+					_ = enc.Encode(wire.Msg{T: wire.TPark})
+					// ModeServer stays until the client closes the ssh pipe:
+					// on macOS the daemon may only reach LAN peers while the
+					// ssh session that started it is alive (Local Network
+					// privacy), so the client keeps it open as an anchor.
 				}
 			}
 		case _, ok := <-dmsgs:

@@ -32,9 +32,10 @@ type Session struct {
 	key    string
 	host   string
 	user   string
-	parent *Session // nil: reachable by ssh (root); else signaled through parent's terminal
-	sock   string   // daemon control socket on the remote host
-	path   string   // selected ICE candidate pair, for ~s
+	parent *Session  // nil: reachable by ssh (root); else signaled through parent's terminal
+	sock   string    // daemon control socket on the remote host
+	path   string    // selected ICE candidate pair, for ~s
+	anchor *pipeWire // bootstrap ssh kept open (macOS LAN permission), closed on finish
 
 	mu       sync.Mutex
 	gen      int
@@ -50,6 +51,8 @@ type Session struct {
 
 	outMu  sync.Mutex // serializes output processing
 	filter wire.OSCFilter
+	shown  bool   // on the stack; before that, output is kept in early
+	early  []byte // output received before the session was shown
 
 	deadCh   chan struct{}
 	done     chan struct{}
@@ -308,8 +311,14 @@ func (s *Session) onFrame(gen int, b []byte) {
 		s.rxOut = off + uint64(len(b)-9)
 		s.mu.Unlock()
 		out, msgs := s.filter.Write(data)
-		if len(out) > 0 && s.c.isTop(s) {
-			s.c.writeOut(out)
+		if len(out) > 0 {
+			if !s.shown {
+				if len(s.early) < 1<<20 {
+					s.early = append(s.early, out...)
+				}
+			} else if s.c.isTop(s) {
+				s.c.writeOut(out)
+			}
 		}
 		for _, m := range msgs {
 			s.onSignal(m)
@@ -372,6 +381,9 @@ func (s *Session) finish(code int) {
 		s.mu.Unlock()
 		close(s.done)
 		log.Printf("[%s] exited %d", s.id, code)
+		if s.anchor != nil {
+			go s.anchor.close()
+		}
 		go func() {
 			time.Sleep(300 * time.Millisecond)
 			if pc != nil {

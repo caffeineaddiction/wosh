@@ -2,6 +2,9 @@ package client
 
 import (
 	"bytes"
+	"errors"
+	"strconv"
+
 	"compress/gzip"
 	"fmt"
 	"io"
@@ -10,9 +13,12 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"wosh/internal/build"
+	"wosh/internal/wire"
 )
 
-// Binary push: run wosh on hosts where it is not installed.
+// Remote start: use an installed wosh, upgrade an older installed one, or
+// run this build from memory.
 //
 // The remote command is a perl one-liner (perl ships with practically every
 // Linux distribution and with macOS). It reports the platform, receives a
@@ -30,11 +36,26 @@ import (
 // must stay free of single quotes, "\\" and "!" so bash, zsh, fish, tcsh and
 // sh all pass them through unchanged.
 
+// pushStub: reports the platform and every installed wosh it can find
+// ($PATH, ~/bin, ~/.local/bin, ~/go/bin) as "<path>|<writable>|<_proto
+// output>", then follows the client's decision (see decide):
+//
+//	USE <path>                 exec an installed wosh
+//	UPGRADE <path> <len>       replace it atomically with the payload, exec it
+//	MEM <len>                  run the payload without installing it
 const pushStub = `$|=1;$o=$^O;$m=` + "`uname -m`" + `;chomp $m;` +
-	`$z=eval{require IO::Uncompress::Gunzip;1}?1:0;` +
-	`print "WOSHPUSH $o $m $z\n";binmode STDIN;$l=<STDIN>;defined $l or exit 1;chomp $l;` +
+	`$z=eval{require IO::Uncompress::Gunzip;1}?1:0;@f=();%s=();` +
+	`for $c ((split /:/,$ENV{PATH}),"$ENV{HOME}/bin","$ENV{HOME}/.local/bin","$ENV{HOME}/go/bin"){` +
+	`$x="$c/wosh";next if $s{$x}++ or $x=~/[|\s]/;next unless -f $x and -x $x;` +
+	`$pv=` + "`\"$x\" _proto 2>/dev/null`" + `;chomp $pv;$pv=~s/[|\s]//g;$pv="-" unless length $pv;` +
+	`$w=(-w $x and -w $c)?1:0;push @f,"$x|$w|$pv"}` +
+	`print "WOSHPUSH $o $m $z @f\n";binmode STDIN;$l=<STDIN>;defined $l or exit 1;chomp $l;` +
+	`($q,$a,$l)=split / /,$l;if($q eq "USE"){exec {$a} "wosh",@ARGV;die "wosh: exec $a failed\n"}` +
+	`$l=$a if $q eq "MEM";` +
 	`$d="";while(length($d)<$l){$r=read(STDIN,$d,$l-length($d),length($d));$r or die "wosh push: short read\n"}` +
 	`if($z){$u="";IO::Uncompress::Gunzip::gunzip(\$d=>\$u) or die "wosh push: gunzip failed\n";$d=$u}` +
+	`if($q eq "UPGRADE"){$t="$a.new.$$";if(open($h,">",$t)){binmode $h;print $h $d;close $h;chmod 0755,$t;` +
+	`if(rename $t,$a){print STDERR "wosh: upgraded $a\n";exec {$a} "wosh",@ARGV}unlink $t}}` +
 	`%n=(x86_64=>319,aarch64=>279);$nm="wosh";` +
 	`if($o eq "linux" and $n{$m}){$f=syscall($n{$m},$nm,0);if($f>=0){open($h,">&=",$f) or die;binmode $h;$w=0;` +
 	`while($w<length $d){$k=syswrite($h,$d,length($d)-$w,$w);defined $k or die "wosh push: write: $^E\n";$w+=$k}` +
@@ -60,7 +81,7 @@ func perlCommand(stub string, args ...string) string {
 
 var (
 	binMu    sync.Mutex
-	binCache = map[string][]byte{}
+	binCache = map[string]*localBuild{}
 )
 
 func normPlatform(goos, arch string) (string, string) {
@@ -78,10 +99,91 @@ func normPlatform(goos, arch string) (string, string) {
 	return goos, arch
 }
 
+type localBuild struct {
+	path  string
+	stamp build.Stamp
+	once  sync.Once
+	z     []byte
+	err   error
+}
+
+// gz returns the gzipped build: from the content-addressed cache
+// (~/.cache/wosh/gz/<stamp>.gz, filled by `wosh _warm` or the first upload),
+// else compressed now and cached for next time.
+func (b *localBuild) gz() ([]byte, error) {
+	b.once.Do(func() {
+		cache := GzCachePath(b.stamp)
+		if z, err := os.ReadFile(cache); err == nil && len(z) > 0 {
+			b.z = z
+			return
+		}
+		b.z, b.err = compressFile(b.path)
+		if b.err == nil && cache != "" {
+			_ = writeAtomic(cache, b.z)
+		}
+	})
+	return b.z, b.err
+}
+
+// GzCachePath is where the gzipped build with this stamp is cached.
+func GzCachePath(st build.Stamp) string {
+	dir, err := os.UserCacheDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(dir, "wosh", "gz", string(st)+".gz")
+}
+
+func compressFile(path string) ([]byte, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var buf bytes.Buffer
+	zw, _ := gzip.NewWriterLevel(&buf, gzip.BestCompression)
+	_, _ = zw.Write(raw)
+	_ = zw.Close()
+	return buf.Bytes(), nil
+}
+
+func writeAtomic(path string, data []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	tmp := fmt.Sprintf("%s.%d.tmp", path, os.Getpid())
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// Warm pre-compresses wosh binaries into the cache (`wosh _warm FILES...`).
+func Warm(paths ...string) error {
+	for _, p := range paths {
+		st, err := build.Of(p)
+		if err != nil {
+			return fmt.Errorf("%s: %w", p, err)
+		}
+		dst := GzCachePath(st)
+		if _, err := os.Stat(dst); err == nil {
+			continue
+		}
+		z, err := compressFile(p)
+		if err != nil {
+			return err
+		}
+		if err := writeAtomic(dst, z); err != nil {
+			return err
+		}
+		fmt.Printf("%s -> %s (%.1f MB)\n", p, dst, float64(len(z))/1e6)
+	}
+	return nil
+}
+
 // binaryFor returns a gzipped wosh build for the remote platform. It uses
 // this executable when the platform matches, else wosh-<os>-<arch> from
 // $WOSH_DIST, <exe dir>/dist, <exe dir> or ~/.cache/wosh.
-func binaryFor(goos, arch string) ([]byte, error) {
+func binaryFor(goos, arch string) (*localBuild, error) {
 	goos, arch = normPlatform(goos, arch)
 	key := goos + "-" + arch
 	binMu.Lock()
@@ -106,43 +208,130 @@ func binaryFor(goos, arch string) ([]byte, error) {
 		cands = append(cands, filepath.Join(home, ".cache", "wosh", name))
 	}
 	for _, p := range cands {
-		raw, err := os.ReadFile(p)
+		st, err := build.Of(p)
 		if err != nil {
 			continue
 		}
-		var buf bytes.Buffer
-		zw, _ := gzip.NewWriterLevel(&buf, gzip.BestCompression)
-		_, _ = zw.Write(raw)
-		_ = zw.Close()
-		binCache[key] = buf.Bytes()
-		return buf.Bytes(), nil
+		b := &localBuild{path: p, stamp: st}
+		binCache[key] = b
+		return b, nil
 	}
 	return nil, fmt.Errorf("no wosh build for %s (looked for %s; run `make dist`)", key, strings.Join(cands, ", "))
 }
 
-// sendBinary answers the push stub's "WOSHPUSH os arch gz" line.
-func sendBinary(w io.Writer, line string) error {
+// installed is one wosh found on the remote host by the stub.
+type installed struct {
+	path     string
+	writable bool
+	proto    int         // 0: unknown / not wosh
+	stamp    build.Stamp // "" if unknown
+}
+
+func parseInstalled(fields []string) []installed {
+	var out []installed
+	for _, f := range fields {
+		parts := strings.SplitN(f, "|", 3)
+		if len(parts) != 3 {
+			continue
+		}
+		in := installed{path: parts[0], writable: parts[1] == "1"}
+		if p, st, ok := strings.Cut(parts[2], "/"); ok {
+			in.proto, _ = strconv.Atoi(p)
+			in.stamp = build.Stamp(st)
+		}
+		out = append(out, in)
+	}
+	return out
+}
+
+// decision is the reply to the stub.
+type decision struct {
+	verb string // USE, UPGRADE, MEM
+	path string
+	why  string
+}
+
+// decide picks what to run on the remote host:
+//
+//  1. an installed copy of exactly this build;
+//  2. upgrade the first installed wosh (PATH order) that is older or
+//     protocol-incompatible, if we may write it - never downgrade;
+//  3. a protocol-compatible installed wosh (e.g. a newer one);
+//  4. otherwise run our build from memory without installing it.
+//
+// ours is nil when we have no build for the remote platform.
+func decide(found []installed, ours *localBuild, force bool) (decision, error) {
+	if force {
+		if ours == nil {
+			return decision{}, errors.New("no build to push for this platform")
+		}
+		return decision{verb: "MEM", why: "--force-push"}, nil
+	}
+	if ours != nil {
+		for _, in := range found {
+			if in.proto == wire.Version && in.stamp == ours.stamp {
+				return decision{verb: "USE", path: in.path, why: "same build installed"}, nil
+			}
+		}
+		if len(found) > 0 {
+			in := found[0] // the one a plain `wosh` would run
+			newer := in.proto != 0 && in.stamp.Time() > ours.stamp.Time()
+			if in.writable && !newer {
+				return decision{verb: "UPGRADE", path: in.path, why: fmt.Sprintf("installed %s/%s is older", protoStr(in.proto), in.stamp)}, nil
+			}
+		}
+	}
+	for _, in := range found {
+		if in.proto == wire.Version {
+			return decision{verb: "USE", path: in.path, why: "compatible build installed"}, nil
+		}
+	}
+	if ours == nil {
+		return decision{}, errors.New("no compatible wosh installed and no build to push for this platform")
+	}
+	return decision{verb: "MEM", why: "no usable installed wosh"}, nil
+}
+
+func protoStr(p int) string {
+	if p == 0 {
+		return "?"
+	}
+	return strconv.Itoa(p)
+}
+
+// answerStub handles the stub's "WOSHPUSH os arch gz [installed...]" line.
+func answerStub(w io.Writer, line string, force bool) (decision, error) {
 	f := strings.Fields(line)
 	if len(f) < 4 {
-		return fmt.Errorf("bad push handshake %q", line)
+		return decision{}, fmt.Errorf("bad push handshake %q", line)
 	}
-	gz, err := binaryFor(f[1], f[2])
+	ours, berr := binaryFor(f[1], f[2])
+	d, err := decide(parseInstalled(f[4:]), ours, force)
 	if err != nil {
-		return err
-	}
-	payload := gz
-	if f[3] != "1" { // remote perl lacks IO::Uncompress::Gunzip
-		zr, err := gzip.NewReader(bytes.NewReader(gz))
-		if err != nil {
-			return err
+		if berr != nil {
+			err = fmt.Errorf("%v (%v)", err, berr)
 		}
-		if payload, err = io.ReadAll(zr); err != nil {
-			return err
+		return d, err
+	}
+	if d.verb == "USE" {
+		_, err = fmt.Fprintf(w, "USE %s\n", d.path)
+		return d, err
+	}
+	var payload []byte
+	if f[3] == "1" {
+		if payload, err = ours.gz(); err != nil {
+			return d, err
 		}
+	} else if payload, err = os.ReadFile(ours.path); err != nil { // remote perl lacks Gunzip
+		return d, err
 	}
-	if _, err := fmt.Fprintf(w, "%d\n", len(payload)); err != nil {
-		return err
+	if d.verb == "UPGRADE" {
+		_, err = fmt.Fprintf(w, "UPGRADE %s %d\n", d.path, len(payload))
+	} else {
+		_, err = fmt.Fprintf(w, "MEM %d\n", len(payload))
 	}
-	_, err = w.Write(payload)
-	return err
+	if err == nil {
+		_, err = w.Write(payload)
+	}
+	return d, err
 }

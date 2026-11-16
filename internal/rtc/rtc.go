@@ -24,13 +24,33 @@ var LogWriter io.Writer = io.Discard
 
 // NewAPI returns a pion API tuned for interactive use: fast failure
 // detection so roaming is noticed quickly.
-func NewAPI() *webrtc.API {
+// Option tweaks the setting engine.
+type Option func(*webrtc.SettingEngine)
+
+func NewAPI(opts ...Option) *webrtc.API {
 	se := webrtc.SettingEngine{}
-	se.LoggerFactory = &logging.DefaultLoggerFactory{Writer: LogWriter, DefaultLogLevel: logging.LogLevelWarn}
+	level := logging.LogLevelWarn
+	if os.Getenv("WOSH_DEBUG") != "" {
+		level = logging.LogLevelDebug
+	}
+	se.LoggerFactory = &logging.DefaultLoggerFactory{Writer: LogWriter, DefaultLogLevel: level}
+	// WOSH_ICE_NET=udp4,udp6 restricts candidate network types (debugging)
+	if v := os.Getenv("WOSH_ICE_NET"); v != "" {
+		var nts []webrtc.NetworkType
+		for _, n := range strings.Split(v, ",") {
+			if nt, err := webrtc.NewNetworkType(strings.TrimSpace(n)); err == nil {
+				nts = append(nts, nt)
+			}
+		}
+		se.SetNetworkTypes(nts)
+	}
 	se.SetICETimeouts(3*time.Second, 8*time.Second, 1*time.Second)
 	se.SetICEMulticastDNSMode(ice.MulticastDNSModeDisabled)
 	if os.Getenv("WOSH_LOOPBACK") != "" {
 		se.SetIncludeLoopbackCandidate(true)
+	}
+	for _, o := range opts {
+		o(&se)
 	}
 	return webrtc.NewAPI(webrtc.WithSettingEngine(se))
 }

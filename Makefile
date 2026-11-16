@@ -6,6 +6,7 @@ bin/wosh:
 	CGO_ENABLED=0 go build -ldflags="$(LDFLAGS)" -o bin/wosh .
 
 dist: bin/wosh $(addprefix bin/dist/wosh-,$(PLATFORMS))
+	bin/wosh _warm bin/wosh $(addprefix bin/dist/wosh-,$(PLATFORMS))
 
 bin/dist/wosh-%:
 	CGO_ENABLED=0 GOOS=$(word 1,$(subst -, ,$*)) GOARCH=$(word 2,$(subst -, ,$*)) \

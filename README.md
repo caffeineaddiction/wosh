@@ -38,33 +38,30 @@ Remote login shell can be anything (bash, zsh, fish, tcsh, nushell, ...): the
 ssh remote command is built from syntax all shells parse identically and
 runs wosh via `sh -c`. Sessions start `$SHELL` (fallback: `/etc/passwd`) as a login shell.
 
-## No install on the remote (default)
+## Remote binary: installed, upgraded, or pushed
 
-```sh
-make dist            # builds bin/dist/wosh-<os>-<arch>
-bin/wosh -J jump1,jump2 user@dest
-```
+Only the client needs wosh. On connect, a perl one-liner on the remote
+reports the platform and every installed wosh it finds (`$PATH`, `~/bin`,
+`~/.local/bin`, `~/go/bin`) with its build stamp (`wosh _proto`:
+protocol / commit time / binary hash). The client then decides:
 
-wosh pushes itself by default. `--no-push` (or `WOSH_PUSH=0`, or an
-explicit `--server-cmd=`) uses an installed wosh instead; if the remote
-has no perl or there is no build for its platform, the client falls back
-to an installed wosh automatically.
+1. **same build installed** - run it (no upload; ~0.4 s to a prompt);
+2. **older build installed and writable** - upgrade it in place (atomic
+   rename; sessions running the old file are unaffected), then run it;
+3. **newer but protocol-compatible** - run it (never downgrade);
+4. otherwise **run this build from memory** without installing it: Linux
+   `memfd` (never on disk); elsewhere (macOS) a temp file deleted right
+   after start.
 
-The remote command is a perl one-liner (perl ships with Linux distros and
-macOS). It reports `uname`, receives the matching gzipped build (~4 MB)
-over the same ssh stdin and executes it:
+Builds for other platforms come from `make dist` (`bin/dist/wosh-<os>-<arch>`;
+also `$WOSH_DIST`, `~/.cache/wosh`). Gzipped copies are cached by stamp in
+`~/.cache/wosh/gz/` (`wosh _warm FILES` / `make dist` pre-fills it).
 
-* **Linux**: from a `memfd` - never written to any filesystem
-  (`/proc/<pid>/exe -> /memfd:wosh (deleted)`).
-* **macOS / memfd blocked**: written to `/dev/shm`, `$TMPDIR`, `/tmp` or
-  `$HOME` (first that works), executed, and deleted as soon as the session
-  daemon is running (about a second on disk).
-
-Reconnects never re-upload: a tiny perl relay talks to the daemon's control
-socket. Builds are looked up in `$WOSH_DIST`, `<exe dir>/dist`, `<exe dir>`
-and `~/.cache/wosh` (`wosh-<os>-<arch>`); the client's own binary is used for
-its own platform. Note: exec from memfd is a known "fileless" technique and
-may be flagged by EDR/security tooling; `vm.memfd_noexec=2` disables it.
+`--force-push` always runs from memory; `--no-push` (or `WOSH_PUSH=0`,
+or `--server-cmd=`) never uploads. Without remote perl, the client falls
+back to an installed wosh. Reconnects never upload: a tiny perl relay
+talks to the daemon's control socket. Memfd exec is a known "fileless"
+technique and may be flagged by EDR; `vm.memfd_noexec=2` disables it.
 
 ## How it works
 
@@ -86,6 +83,25 @@ may be flagged by EDR/security tooling; `vm.memfd_noexec=2` disables it.
 * **Roaming**: 1 s pings (6 s timeout), ICE failure, or a local address
   disappearing trigger reconnect. Root sessions re-run ssh (`BatchMode`) with
   `attach`; nested sessions wait for their parent, then signal through it.
+
+## macOS remotes: Local Network privacy
+
+macOS lets a process started over ssh reach the LAN only while that ssh
+session exists; once orphaned, its sends to LAN addresses fail with
+`no route to host` (incoming traffic still works, so ICE can pick a LAN
+pair that then dies). wosh handles this:
+
+* for macOS hosts the client keeps the bootstrap ssh open (idle) as an
+  anchor, so the direct LAN path stays usable;
+* when the anchor goes away (roaming, ssh dropped) the daemon closes the
+  peer immediately, before the block kicks in, so the client renegotiates
+  in ~0.2 s instead of timing out;
+* before answering, a macOS daemon probes the client's on-link candidates
+  and drops the ones it cannot send to, so ICE picks a working path.
+
+Debugging: `WOSH_DEBUG=1` (verbose pion logs), `WOSH_ICE_NET=udp4|udp6`
+(restrict candidates), `WOSH_KEEP_LOGS=1` (keep daemon logs); `~s` shows
+the selected candidate pair.
 
 ## Security notes
 

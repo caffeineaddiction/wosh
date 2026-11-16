@@ -36,7 +36,8 @@ type Options struct {
 	Auto      bool // accept in-band upgrade requests without asking
 	Term      string
 	Resume    string // "id:key" of a detached root session to reattach to
-	Push      bool   // stream the wosh binary to the remote host (CLI default; falls back to an installed wosh)
+	Push      bool   // remote side via perl stub: use a compatible installed wosh, else upload one (CLI default)
+	ForcePush bool   // upload even if a compatible wosh is installed
 
 	In  io.Reader
 	Out io.Writer
@@ -51,6 +52,8 @@ type Client struct {
 
 	mu    sync.Mutex
 	stack []*Session
+
+	rootPending *Session // connected but not yet shown (see begin)
 
 	outMu      sync.Mutex
 	status     string
@@ -108,11 +111,18 @@ func Start(o Options) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	c.push(root)
+	c.rootPending = root
 	return c, nil
 }
 
+// begin shows the root session (output received so far is flushed now, after
+// the terminal is in raw mode, so replies to terminal queries round-trip)
+// and starts the input / resize / roaming loops.
 func (c *Client) begin() {
+	if r := c.rootPending; r != nil {
+		c.rootPending = nil
+		c.push(r)
+	}
 	go c.inputLoop()
 	go c.winchLoop()
 	go c.netWatch()
@@ -154,23 +164,31 @@ func (c *Client) connectRoot() (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer w.close()
 	if hello.T == wire.TError {
+		w.close()
 		return nil, fmt.Errorf("remote: %s", hello.Err)
 	}
 	if hello.T != wire.THello {
+		w.close()
 		return nil, fmt.Errorf("unexpected %q from remote", hello.T)
 	}
 	s := newSession(c, hello.ID, hello.Host, hello.User, nil)
 	s.sock = hello.Sock
 	if rkey != "" {
 		if hello.ID != rid {
+			w.close()
 			return nil, fmt.Errorf("resumed wrong session %q", hello.ID)
 		}
 		s.key = rkey
 	}
 	err = s.negotiate(w)
-	w.close()
+	if err == nil && hello.OS == "darwin" && rkey == "" {
+		// macOS only lets the daemon talk to LAN peers while the ssh session
+		// that started it exists: keep that (idle) ssh open as an anchor.
+		s.anchor = w
+	} else {
+		w.close()
+	}
 	// The daemon is up and knows our key; transient ICE failures are retried
 	// through the cheap reattach path (no new daemon, no re-upload).
 	for attempt := 1; err != nil && attempt <= 2 && hello.Sock != ""; attempt++ {
@@ -202,9 +220,18 @@ func (c *Client) bootstrap(remote []string) (*pipeWire, wire.Msg, error) {
 // --- session stack -----------------------------------------------------------
 
 func (c *Client) push(s *Session) {
+	s.outMu.Lock()
 	c.mu.Lock()
 	c.stack = append(c.stack, s)
 	c.mu.Unlock()
+	// output that arrived before the session was on screen (e.g. the
+	// shell's startup queries, motd, first prompt) is shown now
+	s.shown = true
+	if len(s.early) > 0 {
+		c.writeOut(s.early)
+		s.early = nil
+	}
+	s.outMu.Unlock()
 	go s.heartbeat()
 	go s.maintain()
 	cols, rows := c.size()

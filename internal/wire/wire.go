@@ -21,8 +21,10 @@ import (
 	"strings"
 )
 
-// Version of the signaling protocol.
-const Version = 1
+// Version of the signaling protocol. A remote wosh is only reused (instead
+// of pushing this build) when its `wosh _proto` prints the same number.
+// 2: hello carries sock/os, relays park/anchor.
+const Version = 2
 
 const (
 	oscPrefix   = "\x1b]5379;wosh;"
@@ -37,6 +39,7 @@ const (
 	TAnswer = "answer" // relay -> client: SDP answer
 	TError  = "err"    // relay -> client: negotiation failed
 	TBye    = "bye"    // client -> relay: client declined / is done
+	TPark   = "park"   // relay -> daemon: I stay connected as the client's ssh anchor
 )
 
 // ICEServer mirrors webrtc.ICEServer without importing pion here.
@@ -63,6 +66,10 @@ type Msg struct {
 	RxOut uint64      `json:"rx_out,omitempty"` // client has received session output up to this offset
 	Err   string      `json:"err,omitempty"`
 	Sock  string      `json:"sock,omitempty"` // hello: daemon control socket (for binary-less reattach)
+	OS    string      `json:"os,omitempty"`   // hello: remote GOOS
+	// Anchor is set by a relay running in the ssh session that launched the
+	// daemon (never trusted from the client: the relay overwrites it).
+	Anchor bool `json:"anchor,omitempty"`
 }
 
 func encode(m Msg) string {

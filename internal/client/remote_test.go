@@ -44,3 +44,20 @@ func TestRemoteCommandAcrossShells(t *testing.T) {
 func writeExec(path, content string) error {
 	return os.WriteFile(path, []byte(content), 0o755)
 }
+
+// The perl stubs travel inside single quotes through any login shell.
+func TestStubsShellSafe(t *testing.T) {
+	for name, stub := range map[string]string{"push": pushStub, "attach": pushAttachStub} {
+		if strings.ContainsAny(stub, "'!\n") || strings.Contains(stub, `\\`) {
+			t.Errorf("%s stub contains a character unsafe inside single quotes", name)
+		}
+	}
+	// and it is valid perl
+	if _, err := exec.LookPath("perl"); err == nil {
+		for name, stub := range map[string]string{"push": pushStub, "attach": pushAttachStub} {
+			if out, err := exec.Command("perl", "-c", "-e", stub).CombinedOutput(); err != nil {
+				t.Errorf("%s stub: %s", name, out)
+			}
+		}
+	}
+}

@@ -11,9 +11,11 @@ import (
 	"strings"
 	"time"
 
+	"wosh/internal/build"
 	"wosh/internal/client"
 	"wosh/internal/rtc"
 	"wosh/internal/server"
+	"wosh/internal/wire"
 )
 
 var version = "0.1.0-dev"
@@ -38,12 +40,15 @@ client flags (always --long so they never collide with ssh flags):
   --stun=URL[,URL]        STUN servers (default stun:stun.l.google.com:19302; env WOSH_STUN)
   --turn=URL|USER|PASS    TURN server(s), ';' separated (env WOSH_TURN)
   --relay                 force TURN relay (hide IP addresses)
-  --no-push               use wosh installed on the remote instead of pushing
-                          (env WOSH_PUSH=0). Default: stream wosh over ssh and
-                          run it from memory (Linux memfd; elsewhere a temp
-                          file deleted right after start); needs remote perl,
-                          falls back to an installed wosh. Builds for other
-                          platforms: make dist (bin/dist/wosh-<os>-<arch>)
+  Default remote start: use an installed wosh (PATH, ~/bin, ~/.local/bin,
+  ~/go/bin) if it is this build; upgrade it in place if it is older and
+  writable; use it if it is newer but compatible; otherwise upload this
+  build over ssh and run it from memory (Linux memfd; elsewhere a temp file
+  deleted right after start). Needs remote perl; without it, an installed
+  wosh is tried.
+  Builds for other platforms: make dist (bin/dist/wosh-<os>-<arch>).
+  --force-push            run this build from memory; ignore/keep installed wosh
+  --no-push               never upload; installed wosh only (env WOSH_PUSH=0)
   --server-cmd=PATH       installed wosh on remote hosts, implies --no-push
                           (default: wosh in PATH, ~/.local/bin, ~/go/bin;
                           env WOSH_SERVER_CMD). Works with any login shell.
@@ -78,7 +83,13 @@ func main() {
 	case "_daemon":
 		daemon(args[1:])
 	case "version", "--version":
-		fmt.Println("wosh", version)
+		fmt.Println("wosh", version, "protocol", wire.Version, "build", build.Self())
+	case "_warm": // pre-compress builds for upload: wosh _warm bin/wosh bin/dist/*
+		if err := client.Warm(args[1:]...); err != nil {
+			fatal("%v", err)
+		}
+	case "_proto":
+		fmt.Printf("%d/%s\n", wire.Version, build.Self())
 	case "help", "--help", "-h":
 		fmt.Print(usage)
 	default:
@@ -164,6 +175,8 @@ func runClient(args []string) int {
 			o.Push = true
 		case "no-push":
 			o.Push = false
+		case "force-push":
+			o.Push, o.ForcePush = true, true
 		case "yes":
 			o.Auto = true
 		case "log":
