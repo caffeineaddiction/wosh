@@ -84,6 +84,9 @@ type Daemon struct {
 	echoed     uint64
 	streams    *stream.Registry
 
+	sock     string      // control socket path
+	sockInfo os.FileInfo // ...and the file we created (a new daemon may reuse the path)
+
 	kick chan struct{}
 	quit chan struct{}
 	once sync.Once
@@ -121,7 +124,13 @@ func RunDaemon(opts DaemonOptions) error {
 		return err
 	}
 	_ = os.Chmod(sock, 0o600)
-	defer os.Remove(sock)
+	sockInfo, _ := os.Stat(sock)
+	defer func() {
+		// remove the socket only if it is still ours
+		if st, err := os.Stat(sock); err == nil && sockInfo != nil && os.SameFile(st, sockInfo) {
+			_ = os.Remove(sock)
+		}
+	}()
 
 	d := &Daemon{
 		opts:    opts,
@@ -134,6 +143,7 @@ func RunDaemon(opts DaemonOptions) error {
 		token:   newToken(),
 		rfwd:    map[int]net.Listener{},
 		streams: stream.NewRegistry(),
+		sock:    sock, sockInfo: sockInfo,
 	}
 	if err := d.setupBinDir(); err != nil {
 		log.Printf("session bin dir: %v", err)
@@ -151,11 +161,7 @@ func RunDaemon(opts DaemonOptions) error {
 	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
 	go func() {
 		<-sigs
-		d.mu.Lock()
-		if d.cmd != nil && d.cmd.Process != nil && !d.exited {
-			_ = syscall.Kill(-d.cmd.Process.Pid, syscall.SIGHUP)
-		}
-		d.mu.Unlock()
+		d.hangUp()
 		d.stop()
 	}()
 	<-d.quit
@@ -181,6 +187,28 @@ func RunDaemon(opts DaemonOptions) error {
 
 func (d *Daemon) stop() { d.once.Do(func() { close(d.quit) }) }
 
+// unreachableWait: how long a daemon without a control socket and without a
+// client lives on.
+const unreachableWait = 5 * time.Second
+
+// sockOK reports whether our control socket file is still there (and ours).
+func (d *Daemon) sockOK() bool {
+	if d.sockInfo == nil {
+		return true // never knew it: do not guess
+	}
+	st, err := os.Stat(d.sock)
+	return err == nil && os.SameFile(st, d.sockInfo)
+}
+
+// hangUp sends SIGHUP to the shell's process group (as a terminal hangup).
+func (d *Daemon) hangUp() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.cmd != nil && d.cmd.Process != nil && !d.exited {
+		_ = syscall.Kill(-d.cmd.Process.Pid, syscall.SIGHUP)
+	}
+}
+
 func (d *Daemon) poke() {
 	select {
 	case d.kick <- struct{}{}:
@@ -192,7 +220,7 @@ func (d *Daemon) poke() {
 // session has been collected (or lingered too long).
 func (d *Daemon) watchdog() {
 	start := time.Now()
-	var exitedAt, orphanSince, goneSince time.Time
+	var exitedAt, orphanSince, goneSince, unreachableSince time.Time
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
 	for {
@@ -217,6 +245,22 @@ func (d *Daemon) watchdog() {
 			}
 		} else {
 			orphanSince = time.Time{}
+		}
+		// Nobody can reach a daemon whose control socket was deleted (its
+		// runtime dir removed: tests, logout without linger). Once no client
+		// is connected either, the session is lost for good: hang it up.
+		if !connected && !d.sockOK() {
+			if unreachableSince.IsZero() {
+				unreachableSince = time.Now()
+			}
+			if time.Since(unreachableSince) > unreachableWait {
+				log.Printf("control socket %s is gone and no client is connected: hanging up", d.sock)
+				d.hangUp()
+				d.stop()
+				return
+			}
+		} else {
+			unreachableSince = time.Time{}
 		}
 		d.mu.Lock()
 		everOpen := d.everOpen
