@@ -3,14 +3,14 @@ PLATFORMS := linux-amd64 linux-arm64 linux-arm darwin-arm64 darwin-amd64 freebsd
 LDFLAGS := -s -w
 
 bin/wosh:
-	CGO_ENABLED=0 go build -ldflags="$(LDFLAGS)" -o bin/wosh .
+	CGO_ENABLED=0 go build -trimpath -ldflags="$(LDFLAGS)" -o bin/wosh .
 
 dist: bin/wosh $(addprefix bin/dist/wosh-,$(PLATFORMS))
 	bin/wosh _warm bin/wosh $(addprefix bin/dist/wosh-,$(PLATFORMS))
 
 bin/dist/wosh-%:
 	CGO_ENABLED=0 GOOS=$(word 1,$(subst -, ,$*)) GOARCH=$(word 2,$(subst -, ,$*)) \
-		go build -ldflags="$(LDFLAGS)" -o $@ .
+		go build -trimpath -ldflags="$(LDFLAGS)" -o $@ .
 
 test:
 	go test ./...

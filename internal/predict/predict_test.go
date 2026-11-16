@@ -566,3 +566,76 @@ func TestUpDownVimNormalModeClamp(t *testing.T) {
 		t.Fatal("correct cursor predictions should keep the epoch confirmed")
 	}
 }
+
+func TestCtrlKAndCtrlU(t *testing.T) {
+	h := newHarness(t, 200*time.Millisecond)
+	h.srv("$ ")
+	h.confirm("e", "e")
+	h.key("cho hello world")
+	h.key("\x1bb") // Alt-B: start of "world"
+	h.key("\x0b")  // Ctrl-K: kill to end
+	if got := h.realRow(0); got != "$ echo hello" || h.realCursorX() != 13 {
+		t.Fatalf("Ctrl-K: %q cursor %d", got, h.realCursorX())
+	}
+	h.key("\x1bb") // start of "hello"
+	h.key("\x15")  // Ctrl-U: kill back to the start of input
+	if got := h.realRow(0); got != "$ hello" || h.realCursorX() != 2 {
+		t.Fatalf("Ctrl-U: %q cursor %d", got, h.realCursorX())
+	}
+	h.key("x") // still predicted after the kill
+	if got := h.realRow(0); got != "$ xhello" || h.realCursorX() != 3 {
+		t.Fatalf("insert after Ctrl-U: %q cursor %d", got, h.realCursorX())
+	}
+	// bash: kill-line clears to eol; unix-line-discard redraws the line
+	h.srv("cho hello world\x1b[5D\x1b[K\x1b[6D\r$ hello\x1b[K\r\x1b[2Cxhello\x1b[5D")
+	h.sameAsServer()
+	if !h.idle() {
+		t.Fatal("predictions left over")
+	}
+	if h.e.confirmedEpoch < h.e.epoch {
+		t.Fatal("kills withdrew the epoch")
+	}
+}
+
+func TestCtrlUWholeLineWithdrawn(t *testing.T) {
+	h := newHarness(t, 200*time.Millisecond)
+	h.srv("$ ")
+	h.confirm("e", "e")
+	h.key("cho hi")
+	h.key("\x1b[D\x1b[D\x15") // Ctrl-U mid-line: predicted as "$ hi"
+	if got := h.realRow(0); got != "$ hi" {
+		t.Fatalf("Ctrl-U: %q", got)
+	}
+	h.srv("cho hi\b\b\r$ \x1b[K") // zsh kill-whole-line
+	h.sameAsServer()
+	if !h.idle() {
+		t.Fatal("predictions left over")
+	}
+}
+
+func TestCtrlKNotPredictedOnWrappedLine(t *testing.T) {
+	h := newHarnessSize(t, 200*time.Millisecond, 10, 6)
+	h.srv("$ ")
+	h.confirm("a", "a")
+	h.srv("bcdefghij\x1b[1;6H") // input wraps to row 1; cursor back on row 0
+	h.key("\x0b")
+	if h.realRow(0) != "$ abcdefgh" || h.realRow(1) != "ij" {
+		t.Fatalf("Ctrl-K predicted across a wrap: %q %q", h.realRow(0), h.realRow(1))
+	}
+	h.key("\x15")
+	if h.realRow(0) != "$ abcdefgh" || h.realCursorX() != 5 {
+		t.Fatalf("Ctrl-U predicted across a wrap: %q cursor %d", h.realRow(0), h.realCursorX())
+	}
+}
+
+func TestCtrlKCtrlUNotPredictedInVim(t *testing.T) {
+	h := newHarnessSize(t, 200*time.Millisecond, 40, 8)
+	h.srv("\x1b[?1049h\x1b[H\x1b[2Jfoo bar\r\n~\r\n~\x1b[1;1H")
+	h.key("i")
+	h.srv("\x1b[8;1H-- INSERT --\x1b[1;1H")
+	h.confirm("X", "Xfoo bar\x1b[1;2H")
+	h.key("\x0b\x15") // vim insert: digraph, delete inserted text; nano: cut, paste
+	if h.realRow(0) != "Xfoo bar" || h.realCursorX() != 1 {
+		t.Fatalf("predicted in vim: %q cursor %d", h.realRow(0), h.realCursorX())
+	}
+}

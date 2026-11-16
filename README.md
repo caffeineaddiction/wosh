@@ -98,12 +98,13 @@ and keystrokes are applied to a predicted copy of the screen:
 | Home / End, Ctrl-A / Ctrl-E | start of input / end of text | column 0 / end of text (Ctrl-A/E not predicted) |
 | Alt-B, Ctrl-Left / Alt-F, Ctrl-Right | previous word start / next word end | previous / next word start |
 | Ctrl-W, Alt-Backspace | delete back to whitespace / previous word | not predicted |
+| Ctrl-K / Ctrl-U | kill to end of text / back to start of input | not predicted |
 | Up / Down | not predicted (history) | move a line, keeping the wanted column |
 
 The "start of input" is learned from the cursor at the first key on a fresh
-prompt (after Enter, Ctrl-C, Ctrl-U or Ctrl-L). In vim's normal mode the
-cursor is kept on the last character of short lines; with `-- INSERT --`
-showing, or in nano, it may sit after the text. Changed cells and the
+prompt (after Enter, Ctrl-C, Ctrl-L or a Ctrl-U that was not predicted). In
+vim's normal mode the cursor is kept on the last character of short lines;
+with `-- INSERT --` showing, or in nano, it may sit after the text. Changed cells and the
 predicted cursor are drawn immediately - typed text underlined while the
 round trip is > 80 ms or the link is down.
 
@@ -119,7 +120,9 @@ normal mode) never show predicted text, while navigation does. Enter, Tab,
 shell Up/Down and other control keys are not predicted, and nothing after
 them is until the server has processed them. Apps with different word
 rules (fish treats punctuation as word boundaries) just get their
-predictions withdrawn after one round trip. Wide characters (CJK, emoji) and wrapping at
+predictions withdrawn after one round trip, as does zsh's Ctrl-U (which
+kills the whole line). Ctrl-K/Ctrl-U are not predicted on input that wraps
+past the right margin. Wide characters (CJK, emoji) and wrapping at
 the right margin (not on the bottom row) are handled.
 
 `--predict=adaptive` (default: when the smoothed round trip is > 30 ms or
@@ -209,12 +212,13 @@ the selected candidate pair.
 * Reconnecting the root needs non-interactive ssh auth (keys/agent).
 * Hops reached with plain ssh still need `wosh up` and an installed wosh;
   use `wosh host` from inside a session instead (chained hop).
-* Word movement follows readline rules in shells; fish's own rules differ
-  (mispredictions are withdrawn, not left on screen).
+* Word movement and Ctrl-U follow readline rules in shells; fish's word
+  rules and zsh's Ctrl-U differ (mispredictions are withdrawn, not left on
+  screen).
 * A chained hop ends the intermediate host's forwarded connections (by
   design); new connections go to the new destination.
 * tmux/screen on an intermediate hop swallow unknown OSC (use passthrough).
-* No predictive local echo (mosh's SSP); no IPv6-only/TURN-TCP tuning yet.
+* No IPv6-only/TURN-TCP tuning yet.
 * Sessions detached with `~&` can only be resumed at the root (`--resume`).
 
 ## Tests

@@ -319,6 +319,8 @@ const (
 	kWordRight
 	kKillWord  // Ctrl-W: back to whitespace (shells only)
 	kKillAlnum // Alt-Backspace: previous word (shells only)
+	kKillEnd   // Ctrl-K: cursor to end of text (shells only)
+	kKillStart // Ctrl-U: start of input to cursor (shells only)
 	kUp        // full-screen apps only (shells: history)
 	kDown
 	kOther
@@ -349,6 +351,10 @@ func nextKey(p []byte, altScreen bool) (kind keyKind, text string, n int) {
 		return kEnd, "", 1
 	case p[0] == 0x17 && !altScreen: // Ctrl-W
 		return kKillWord, "", 1
+	case p[0] == 0x0b && !altScreen: // Ctrl-K
+		return kKillEnd, "", 1
+	case p[0] == 0x15 && !altScreen: // Ctrl-U
+		return kKillStart, "", 1
 	case p[0] == 0x1b:
 		for _, k := range cursorKeys {
 			if bytes.HasPrefix(p, []byte(k.seq)) {
@@ -388,18 +394,21 @@ func (e *Engine) Input(p []byte, off uint64) []byte {
 			e.blind(off) // Enter, Tab, Up/Down, Ctrl-..: unpredictable
 			e.epoch++
 			switch key {
-			case '\r', '\n', 0x03, 0x15, 0x0c: // Enter, Ctrl-C, Ctrl-U, Ctrl-L
+			case '\r', '\n', 0x03, 0x15, 0x0c: // Enter, Ctrl-C, Ctrl-U (full-screen apps), Ctrl-L
 				e.freshAt = off // the next prompt / empty input starts after this
 			}
 			continue
 		}
 		if e.processed() < e.blindUntil {
 			e.blind(off) // still waiting for the server to catch up
-			continue
-		}
-		if !e.apply(kind, text, off) {
+		} else if !e.apply(kind, text, off) {
 			e.blind(off)
 			e.epoch++
+		} else {
+			continue
+		}
+		if kind == kKillStart {
+			e.freshAt = off // not modelled: relearn the input start from the server
 		}
 	}
 	e.draw(&b)
@@ -646,6 +655,19 @@ func (e *Engine) apply(kind keyKind, text string, off uint64) bool {
 		}
 		nx = startX(gs, to)
 		gs = append(gs[:to], gs[idx:]...)
+	case kKillEnd: // readline kill-line
+		if startX(gs, textEnd) >= e.cols {
+			return false // text reaches the margin: may continue on the next row
+		}
+		if idx < textEnd {
+			gs = gs[:idx]
+		}
+	case kKillStart: // readline unix-line-discard (zsh kills the whole line: withdrawn)
+		if !startOK || idx < startIdx || startX(gs, textEnd) >= e.cols {
+			return false
+		}
+		nx = lineStart
+		gs = append(gs[:startIdx], gs[idx:]...)
 	}
 	after, ok := e.layout(gs)
 	if !ok || nx > e.cols || (nx == e.cols && kind != kText) {
