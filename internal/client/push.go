@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"wosh/internal/build"
+	"wosh/internal/stream"
 	"wosh/internal/wire"
 )
 
@@ -216,7 +217,63 @@ func binaryFor(goos, arch string) (*localBuild, error) {
 		binCache[key] = b
 		return b, nil
 	}
+	if stream.InSession() {
+		// chained hop: the wosh client upstream has the builds
+		if b, err := fetchBuild(key); err == nil {
+			binCache[key] = b
+			return b, nil
+		} else {
+			return nil, fmt.Errorf("no wosh build for %s here or at the wosh client: %v", key, err)
+		}
+	}
 	return nil, fmt.Errorf("no wosh build for %s (looked for %s; run `make dist`)", key, strings.Join(cands, ", "))
+}
+
+// fetchBuild gets a gzipped build from the wosh client of this session.
+func fetchBuild(key string) (*localBuild, error) {
+	s, err := stream.ToClient(wire.StreamSpec{K: "build", Cmd: key})
+	if err != nil {
+		return nil, err
+	}
+	defer s.Close()
+	b := &localBuild{}
+	var z []byte
+	for {
+		t, p, err := s.Recv()
+		if err != nil {
+			return nil, err
+		}
+		switch t {
+		case stream.Exit: // stamp
+			b.stamp = build.Stamp(p)
+		case stream.Data:
+			z = append(z, p...)
+		case stream.Err:
+			return nil, fmt.Errorf("%s", p)
+		case stream.Fin:
+			b.once.Do(func() { b.z = z })
+			return b, nil
+		}
+	}
+}
+
+// serveBuild sends a gzipped build to a chained hop that needs one.
+func serveBuild(ch *stream.Chan, key string) {
+	goos, arch, _ := strings.Cut(key, "-")
+	b, err := binaryFor(goos, arch)
+	var z []byte
+	if err == nil {
+		z, err = b.gz()
+	}
+	if err != nil {
+		_ = ch.Send(stream.Err, []byte(err.Error()))
+		_ = ch.Close()
+		return
+	}
+	_ = ch.Send(stream.Exit, []byte(b.stamp))
+	_ = ch.Send(stream.Data, z)
+	_ = ch.Send(stream.Fin, nil)
+	_ = ch.Close()
 }
 
 // installed is one wosh found on the remote host by the stub.

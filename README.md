@@ -84,6 +84,39 @@ technique and may be flagged by EDR; `vm.memfd_noexec=2` disables it.
   disappearing trigger reconnect. Root sessions re-run ssh (`BatchMode`) with
   `attach`; nested sessions wait for their parent, then signal through it.
 
+## Inside a session
+
+* **Environment**: `LANG`, `LC_*`, `COLORTERM` are forwarded; `--env=K=V`
+  adds more. `WOSH_SESSION`, `WOSH_SOCK`, `WOSH_BIN`, `WOSH_BIN_DIR` are set.
+* **wosh on PATH**: a per-session bin dir (in the runtime dir, a tmpfs on
+  most Linux systems) is prepended to `PATH` with `wosh`, `ssh`, `scp`,
+  `sftp`. On Linux they point at `/proc/<daemon>/exe`, so a pushed,
+  memory-only wosh is usable from the CLI without touching disk.
+* **Chained hops**: `wosh hostC` inside a session on B does the ssh from B
+  (C may be reachable only from B), then hands C to your client, which
+  connects to C directly (authenticated by B's session token, no prompt;
+  the build for C's platform is fetched from your client if B lacks it).
+  B idles in the background as C's reconnect path; exiting C returns to B.
+* **`src:` = your client**: `rsync -a src:dir/ .`, `scp f src:`,
+  `sftp src`. Transfers (rsync --server, scp -t/-f, sftp subsystem) run on
+  the client over the wosh channel after a once-per-session prompt
+  (`--allow-src` skips it), in your home directory. Anything else (e.g.
+  `ssh src`) falls back to real ssh into the client's sshd, tunnelled via
+  wosh. `--src=NAME` renames the alias.
+* **Port forwarding**: `-L`, `-R`, `-D` with ssh syntax, over extra data
+  channels (forwarded TCP connections do not survive a reconnect yet).
+
+If your shell rc rebuilds `PATH` (common with fish), the session bin dir
+may end up behind `/usr/bin`; rsync still works (`RSYNC_RSH` is set) but
+`scp`/`sftp` to `src:` need the shims first. Add at the end of your rc:
+
+```sh
+# fish
+set -q WOSH_BIN_DIR; and fish_add_path --prepend --move $WOSH_BIN_DIR
+# bash / zsh
+[ -n "$WOSH_BIN_DIR" ] && PATH="$WOSH_BIN_DIR:$PATH"
+```
+
 ## macOS remotes: Local Network privacy
 
 macOS lets a process started over ssh reach the LAN only while that ssh
@@ -117,8 +150,10 @@ the selected candidate pair.
 ## Limitations / TODO
 
 * Reconnecting the root needs non-interactive ssh auth (keys/agent).
-* Pushing covers the root host only; nested hops still need `wosh up`
-  (in-band push through the terminal is planned).
+* Hops reached with plain ssh still need `wosh up` and an installed wosh;
+  use `wosh host` from inside a session instead (chained hop).
+* Forwarded TCP connections break on reconnect (the session does not).
+* Forwards (-L/-R/-D) apply to the root session only.
 * tmux/screen on an intermediate hop swallow unknown OSC (use passthrough).
 * No predictive local echo (mosh's SSP); no IPv6-only/TURN-TCP tuning yet.
 * Sessions detached with `~&` can only be resumed at the root (`--resume`).

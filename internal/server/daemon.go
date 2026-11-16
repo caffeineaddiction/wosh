@@ -23,6 +23,7 @@ import (
 	"github.com/pion/webrtc/v4"
 
 	"wosh/internal/rtc"
+	"wosh/internal/stream"
 	"wosh/internal/wire"
 )
 
@@ -40,6 +41,9 @@ type DaemonOptions struct {
 	Linger  time.Duration // how long to keep an exited session around for a client to collect it
 	Command []string      // command to run instead of the login shell
 	ReadyFD *os.File      // written to once the control socket is listening
+	// OwnBinary: pushed temp file this daemon runs from (no memfd); kept in
+	// the session bin dir and deleted with the session.
+	OwnBinary string
 }
 
 // Daemon owns one PTY session and serves WebRTC peers for it.
@@ -63,6 +67,13 @@ type Daemon struct {
 	exitDelivered bool
 	everOpen      bool // some peer connected at least once
 	conns         map[net.Conn]chan struct{}
+
+	token      string // shared with the client; proves a chained hop's hello
+	clientUser string // client's local user (src: ssh fallback)
+	src        string // host alias meaning "the client"
+	baseDir    string // <runtime>/<id>.d
+	binDir     string // session bin dir (wosh + shims), first in PATH
+	rfwd       map[int]net.Listener
 
 	kick chan struct{}
 	quit chan struct{}
@@ -103,6 +114,11 @@ func RunDaemon(opts DaemonOptions) error {
 		quit:  make(chan struct{}),
 		ln:    ln,
 		conns: map[net.Conn]chan struct{}{},
+		token: newToken(),
+		rfwd:  map[int]net.Listener{},
+	}
+	if err := d.setupBinDir(); err != nil {
+		log.Printf("session bin dir: %v", err)
 	}
 	if opts.ReadyFD != nil {
 		_, _ = opts.ReadyFD.Write([]byte{1})
@@ -131,6 +147,12 @@ func RunDaemon(opts DaemonOptions) error {
 		_ = d.cur.pc.Close()
 	}
 	d.mu.Unlock()
+	for _, l := range d.rfwd {
+		_ = l.Close()
+	}
+	if d.baseDir != "" {
+		_ = os.RemoveAll(d.baseDir)
+	}
 	log.Printf("daemon %s exiting", opts.ID)
 	if dir, err := RuntimeDir(); err == nil && os.Getenv("WOSH_KEEP_LOGS") == "" {
 		_ = os.Remove(filepath.Join(dir, opts.ID+".log"))
@@ -151,7 +173,7 @@ func (d *Daemon) poke() {
 // session has been collected (or lingered too long).
 func (d *Daemon) watchdog() {
 	start := time.Now()
-	var exitedAt, orphanSince time.Time
+	var exitedAt, orphanSince, goneSince time.Time
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
 	for {
@@ -193,6 +215,20 @@ func (d *Daemon) watchdog() {
 			if exitedAt.IsZero() {
 				exitedAt = time.Now()
 			}
+			if !connected {
+				if goneSince.IsZero() {
+					goneSince = time.Now()
+				}
+			} else {
+				goneSince = time.Time{}
+			}
+			// the shell is gone and so is the client: nobody will collect
+			// the exit status unless the client comes back within a minute
+			if !goneSince.IsZero() && time.Since(goneSince) > time.Minute {
+				log.Printf("shell exited, client gone")
+				d.stop()
+				return
+			}
 			if acked || (d.opts.Linger > 0 && time.Since(exitedAt) > d.opts.Linger) {
 				time.Sleep(200 * time.Millisecond)
 				d.stop()
@@ -229,13 +265,16 @@ func (d *Daemon) serveConn(c net.Conn) {
 		close(gone)
 	}()
 	go func() { <-d.quit; c.Close() }()
-	sc := bufio.NewScanner(c)
-	sc.Buffer(make([]byte, 64*1024), 1<<20)
+	r := bufio.NewReaderSize(c, 64*1024)
 	enc := json.NewEncoder(c)
 	anchored := false
-	for sc.Scan() {
+	for {
+		line, err := r.ReadBytes('\n')
+		if err != nil {
+			break
+		}
 		var m wire.Msg
-		if err := json.Unmarshal(sc.Bytes(), &m); err != nil {
+		if err := json.Unmarshal(line, &m); err != nil {
 			_ = enc.Encode(wire.Msg{T: wire.TError, Err: "bad message"})
 			continue
 		}
@@ -257,6 +296,35 @@ func (d *Daemon) serveConn(c net.Conn) {
 			}
 		case wire.TPark:
 			anchored = true
+		case wire.TInfo:
+			d.mu.Lock()
+			u, src := d.clientUser, d.src
+			d.mu.Unlock()
+			_ = enc.Encode(wire.Msg{T: wire.TInfo, User: u, Src: src})
+		case wire.TType:
+			d.mu.Lock()
+			ptmx := d.ptmx
+			d.mu.Unlock()
+			if ptmx == nil || len(m.Text) > 4096 {
+				_ = enc.Encode(wire.Msg{T: wire.TError, Err: "no session terminal"})
+				continue
+			}
+			_, _ = ptmx.Write([]byte(m.Text))
+			_ = enc.Encode(wire.Msg{T: wire.TOK})
+		case wire.TOpen:
+			// a local helper (ssh/scp shim) wants a stream to the client;
+			// after the reply the connection carries stream frames
+			if m.Stream == nil {
+				continue
+			}
+			ch, err := d.openToClient(*m.Stream)
+			if err != nil {
+				_ = enc.Encode(wire.Msg{T: wire.TError, Err: err.Error()})
+				return
+			}
+			_ = enc.Encode(wire.Msg{T: wire.TOK})
+			stream.Relay(ch, stream.NewFramed(r, c, c))
+			return
 		}
 	}
 	d.mu.Lock()
@@ -296,14 +364,7 @@ func (d *Daemon) startShell(m wire.Msg) error {
 	if term == "" {
 		term = "xterm-256color"
 	}
-	env := []string{}
-	for _, e := range os.Environ() {
-		if strings.HasPrefix(e, "TERM=") || strings.HasPrefix(e, "WOSH_SESSION=") {
-			continue
-		}
-		env = append(env, e)
-	}
-	cmd.Env = append(env, "TERM="+term, "WOSH_SESSION="+d.opts.ID)
+	cmd.Env = d.sessionEnv(term, m.Env)
 	size := &pty.Winsize{Cols: m.Cols, Rows: m.Rows}
 	if size.Cols == 0 || size.Rows == 0 {
 		size = &pty.Winsize{Cols: 80, Rows: 24}
@@ -435,7 +496,11 @@ func (d *Daemon) handleOffer(m wire.Msg) (wire.Msg, error) {
 		d.mu.Unlock()
 		return wire.Msg{}, errors.New("bad session key")
 	}
+	if m.User != "" {
+		d.clientUser = m.User
+	}
 	if !d.started {
+		d.src = m.Src
 		if err := d.startShell(m); err != nil {
 			d.mu.Unlock()
 			return wire.Msg{}, fmt.Errorf("start shell: %w", err)
@@ -451,6 +516,10 @@ func (d *Daemon) handleOffer(m wire.Msg) (wire.Msg, error) {
 	p := &peer{pc: pc, sent: m.RxOut, low: make(chan struct{}, 1)}
 
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
+		if spec, ok := stream.ParseLabel(dc.Label()); ok {
+			go d.fromClient(stream.Wrap(dc), spec)
+			return
+		}
 		if dc.Label() != "wosh" {
 			return
 		}
@@ -474,6 +543,7 @@ func (d *Daemon) handleOffer(m wire.Msg) (wire.Msg, error) {
 			}
 			log.Printf("peer connected")
 			_ = dc.Send(wire.U64Frame(wire.FAck, d.inputRx()))
+			_ = dc.Send(wire.ControlFrame(wire.Control{Op: "info", Token: d.token}))
 			d.poke()
 		})
 		dc.OnMessage(func(msg webrtc.DataChannelMessage) { d.onFrame(p, msg.Data) })
@@ -577,6 +647,10 @@ func (d *Daemon) onFrame(p *peer, b []byte) {
 		d.mu.Lock()
 		d.exitAck = true
 		d.mu.Unlock()
+	case wire.FControl:
+		if c, ok := wire.ParseControl(b); ok && c.Op == "rfwd" {
+			d.listenRemote(c.Rfwd)
+		}
 	case wire.FKill:
 		d.mu.Lock()
 		cmd, exited := d.cmd, d.exited
@@ -589,5 +663,83 @@ func (d *Daemon) onFrame(p *peer, b []byte) {
 			time.Sleep(3 * time.Second)
 			d.stop()
 		}()
+	}
+}
+
+// --- streams --------------------------------------------------------------------
+
+// openToClient opens a stream from this host to the client.
+func (d *Daemon) openToClient(spec wire.StreamSpec) (*stream.Chan, error) {
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		d.mu.Lock()
+		p := d.cur
+		d.mu.Unlock()
+		if p != nil && p.open {
+			return stream.Open(p.pc, spec)
+		}
+		if time.Now().After(deadline) {
+			return nil, errors.New("wosh client not connected")
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// fromClient serves a stream the client opened: -L / -D forwards, which this
+// host dials (like ssh's direct-tcpip).
+func (d *Daemon) fromClient(ch *stream.Chan, spec wire.StreamSpec) {
+	if spec.K != "tcp" || spec.Port <= 0 || spec.Port > 65535 {
+		_ = ch.Send(stream.Err, []byte("unsupported stream"))
+		_ = ch.Close()
+		return
+	}
+	c, err := net.DialTimeout("tcp", net.JoinHostPort(spec.Host, fmt.Sprint(spec.Port)), 10*time.Second)
+	if err != nil {
+		_ = ch.Send(stream.Err, []byte(err.Error()))
+		_ = ch.Close()
+		return
+	}
+	stream.Splice(ch, c)
+}
+
+// listenRemote starts -R listeners (idempotent: the client resends its list
+// after every reconnect).
+func (d *Daemon) listenRemote(fwds []wire.RemoteFwd) {
+	for _, f := range fwds {
+		d.mu.Lock()
+		_, exists := d.rfwd[f.ID]
+		d.mu.Unlock()
+		if exists {
+			continue
+		}
+		bind := f.Bind
+		if bind == "" {
+			bind = "localhost"
+		}
+		l, err := net.Listen("tcp", net.JoinHostPort(bind, fmt.Sprint(f.Port)))
+		if err != nil {
+			log.Printf("-R %s:%d: %v", bind, f.Port, err)
+			continue
+		}
+		d.mu.Lock()
+		d.rfwd[f.ID] = l
+		d.mu.Unlock()
+		log.Printf("-R listening on %s (id %d)", l.Addr(), f.ID)
+		go func(id int) {
+			for {
+				c, err := l.Accept()
+				if err != nil {
+					return
+				}
+				go func() {
+					ch, err := d.openToClient(wire.StreamSpec{K: "rfwd", ID: id})
+					if err != nil {
+						_ = c.Close()
+						return
+					}
+					stream.Splice(ch, c)
+				}()
+			}
+		}(f.ID)
 	}
 }

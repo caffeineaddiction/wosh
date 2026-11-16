@@ -40,6 +40,10 @@ const (
 	TError  = "err"    // relay -> client: negotiation failed
 	TBye    = "bye"    // client -> relay: client declined / is done
 	TPark   = "park"   // relay -> daemon: I stay connected as the client's ssh anchor
+	TOpen   = "open"   // shim -> daemon: open a stream to the client, then raw frames
+	TInfo   = "info"   // shim -> daemon: who is the client (reply carries User)
+	TType   = "type"   // local tool -> daemon: type Text into the session (e.g. reload the shell)
+	TOK     = "ok"
 )
 
 // ICEServer mirrors webrtc.ICEServer without importing pion here.
@@ -70,6 +74,23 @@ type Msg struct {
 	// Anchor is set by a relay running in the ssh session that launched the
 	// daemon (never trusted from the client: the relay overwrites it).
 	Anchor bool `json:"anchor,omitempty"`
+
+	Env    map[string]string `json:"env,omitempty"`    // offer: variables for the session shell
+	Src    string            `json:"src,omitempty"`    // offer: host name that means "the client" (src:path)
+	Token  string            `json:"token,omitempty"`  // hello: parent session token (chained hop, no prompt)
+	Via    string            `json:"via,omitempty"`    // hello: host that relayed a chained hop
+	Stream *StreamSpec       `json:"stream,omitempty"` // control socket: open a stream to the client
+	Text   string            `json:"text,omitempty"`   // control socket: input for TType
+}
+
+// StreamSpec describes an extra data channel (port forward, file transfer).
+type StreamSpec struct {
+	K    string `json:"k"`              // tcp | rfwd | exec | src-ssh
+	Host string `json:"host,omitempty"` // tcp: target host (dialed by the daemon)
+	Port int    `json:"port,omitempty"` // tcp: target port
+	ID   int    `json:"id,omitempty"`   // rfwd: forward id
+	Cmd  string `json:"cmd,omitempty"`  // exec: command line / subsystem name
+	Sub  bool   `json:"sub,omitempty"`  // exec: Cmd is an ssh subsystem (sftp)
 }
 
 func encode(m Msg) string {

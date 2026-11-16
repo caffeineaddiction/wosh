@@ -8,13 +8,20 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
+
+	"golang.org/x/term"
 
 	"wosh/internal/build"
 	"wosh/internal/client"
 	"wosh/internal/rtc"
 	"wosh/internal/server"
+	"wosh/internal/shellfix"
+	"wosh/internal/shim"
+	"wosh/internal/stream"
 	"wosh/internal/wire"
 )
 
@@ -32,6 +39,13 @@ usage:
       Run inside a wosh session, on a host you reached with plain ssh
       (client -wosh-> dest1 -ssh-> dest2). The client upgrades to a direct
       link to this host; this terminal stays parked as the signaling path.
+
+  wosh --fix-shell[=SHELL] [--no-reload]
+      Make the session bin dir (wosh, ssh/scp/sftp for src:) win in PATH
+      even if your shell rc rebuilds PATH: appends a managed block to the
+      end of the rc file(s) of $SHELL (fish, bash, zsh, sh, tcsh), backs
+      the file up once (*.wosh.bak) and, inside a wosh session, reloads
+      the shell (exec $SHELL -l). --unfix-shell removes the block.
 
   wosh server | wosh attach ID     (remote side, used by the client)
   wosh version
@@ -53,19 +67,44 @@ client flags (always --long so they never collide with ssh flags):
                           (default: wosh in PATH, ~/.local/bin, ~/go/bin;
                           env WOSH_SERVER_CMD). Works with any login shell.
   --ssh=PATH              ssh binary (default ssh)
+  -L [bind:]port:host:hostport   forward local port to host:hostport (dialed remotely)
+  -R [bind:]port:host:hostport   forward remote port to host:hostport (dialed here)
+  -D [bind:]port                 local SOCKS5 proxy through the remote host
+  --env=NAME=VALUE        set a variable in remote sessions (LANG, LC_*,
+                          COLORTERM are forwarded automatically)
+  --src=NAME              host name meaning "this client" inside sessions
+                          (default src: rsync src:dir ., scp f src:, sftp src)
+  --allow-src             serve src: transfers without asking
   --resume=ID:KEY         reattach to a detached root session
   --yes                   accept in-band upgrade requests without asking
   --log=FILE              debug log
   --local=CMD             testing: run CMD locally instead of ssh
 
+inside a session:
+  wosh host      chained hop: connect this client directly to host (ssh'd
+                 from here), this session idles until host's session ends
+  wosh, ssh, scp, sftp are on PATH; host "src" is the wosh client
+
 escapes (after Enter): ~. quit  ~& detach  ~s sessions  ~? help
 `
 
 func main() {
+	// session bin dir links: ssh/scp/sftp stand-ins (see internal/shim)
+	switch filepath.Base(os.Args[0]) {
+	case "ssh":
+		os.Exit(shim.SSH(os.Args[1:]))
+	case "scp":
+		os.Exit(shim.SCP(os.Args[1:]))
+	case "sftp":
+		os.Exit(shim.SFTP(os.Args[1:]))
+	}
 	args := os.Args[1:]
 	if len(args) == 0 {
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)
+	}
+	if a := args[0]; a == "fix-shell" || a == "--fix-shell" || strings.HasPrefix(a, "--fix-shell=") || a == "--unfix-shell" {
+		os.Exit(fixShell(args))
 	}
 	switch args[0] {
 	case "server":
@@ -80,6 +119,8 @@ func main() {
 			fatal("usage: wosh attach ID")
 		}
 		relay(server.ModeAttach, args[1], nil)
+	case "_proxy":
+		os.Exit(shim.Proxy())
 	case "_daemon":
 		daemon(args[1:])
 	case "version", "--version":
@@ -127,6 +168,9 @@ func daemon(args []string) {
 				fatal("bad --linger")
 			}
 			o.Linger = d
+		case "--own-binary":
+			i++
+			o.OwnBinary = args[i]
 		case "--":
 			o.Command = args[i+1:]
 			i = len(args)
@@ -147,10 +191,25 @@ func runClient(args []string) int {
 	o.Push = os.Getenv("WOSH_PUSH") != "0" && o.ServerCmd == ""
 	logFile := ""
 	var sshArgs []string
-	for i, a := range args {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
 		if a == "--" {
 			sshArgs = append(sshArgs, args[i+1:]...)
 			break
+		}
+		// -L/-R/-D are wosh's (forwarded over WebRTC), not the bootstrap ssh's
+		if len(a) >= 2 && a[0] == '-' && strings.IndexByte("LRD", a[1]) >= 0 {
+			spec := a[2:]
+			if spec == "" && i+1 < len(args) {
+				i++
+				spec = args[i]
+			}
+			f, err := client.ParseForward(a[1], spec)
+			if err != nil {
+				fatal("%v", err)
+			}
+			o.Forwards = append(o.Forwards, f)
+			continue
 		}
 		if !strings.HasPrefix(a, "--") {
 			sshArgs = append(sshArgs, a)
@@ -179,6 +238,19 @@ func runClient(args []string) int {
 			o.Push, o.ForcePush = true, true
 		case "yes":
 			o.Auto = true
+		case "env":
+			k, val, ok := strings.Cut(v, "=")
+			if !ok || k == "" {
+				fatal("--env wants NAME=VALUE")
+			}
+			if o.Env == nil {
+				o.Env = map[string]string{}
+			}
+			o.Env[k] = val
+		case "src":
+			o.Src = v
+		case "allow-src":
+			o.AllowSrc = true
 		case "log":
 			logFile = v
 		case "local":
@@ -205,10 +277,116 @@ func runClient(args []string) int {
 		rtc.LogWriter = f
 	}
 
+	if os.Getenv("WOSH_SESSION") != "" && os.Getenv("WOSH_NO_CHAIN") == "" && term.IsTerminal(int(os.Stdin.Fd())) {
+		// inside a wosh session: hand the new host to the client upstream
+		// so it connects directly (chained hop) instead of nesting clients
+		if bin := os.Getenv("WOSH_BIN_DIR"); bin != "" && o.SSH == "" {
+			o.SSH = shimFreeSSH()
+		}
+		if len(o.Forwards) > 0 {
+			fmt.Fprintln(os.Stderr, "wosh: -L/-R/-D are not supported on chained hops yet; ignoring")
+		}
+		code, err := client.Delegate(o)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "wosh: %v\n", err)
+			return 255
+		}
+		return code
+	}
 	code, err := client.Run(o)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "wosh: %v\n", err)
 		return 255
 	}
 	return code
+}
+
+// shimFreeSSH: the real ssh, not our stand-in (avoids a needless hop).
+func shimFreeSSH() string {
+	bin := os.Getenv("WOSH_BIN_DIR")
+	for _, dir := range filepath.SplitList(os.Getenv("PATH")) {
+		if dir == bin || dir == "" {
+			continue
+		}
+		p := filepath.Join(dir, "ssh")
+		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+			if r, _ := filepath.EvalSymlinks(p); r != "" && filepath.Base(r) == "ssh" {
+				return p
+			}
+		}
+	}
+	return "ssh"
+}
+
+func fixShell(args []string) int {
+	shell, reload, undo := "", true, false
+	for _, a := range args {
+		switch {
+		case a == "--no-reload":
+			reload = false
+		case a == "--unfix-shell":
+			undo = true
+		case strings.HasPrefix(a, "--fix-shell="):
+			shell = strings.TrimPrefix(a, "--fix-shell=")
+		}
+	}
+	if shell == "" {
+		shell = os.Getenv("SHELL")
+	}
+	if shell == "" {
+		shell = server.LoginShell()
+	}
+	targets, err := shellfix.Targets(shell)
+	if err != nil {
+		fatal("%v", err)
+	}
+	changed := false
+	for _, t := range targets {
+		if undo {
+			ch, err := shellfix.Remove(t)
+			if err != nil {
+				fatal("%s: %v", t.File, err)
+			}
+			if ch {
+				fmt.Printf("wosh: removed block from %s\n", t.File)
+			}
+			continue
+		}
+		ch, bak, err := shellfix.Apply(t)
+		if err != nil {
+			fatal("%s: %v", t.File, err)
+		}
+		switch {
+		case ch && bak != "":
+			fmt.Printf("wosh: updated %s (original saved as %s)\n", t.File, bak)
+		case ch:
+			fmt.Printf("wosh: created %s\n", t.File)
+		default:
+			fmt.Printf("wosh: %s is already up to date\n", t.File)
+		}
+		changed = changed || ch
+	}
+	if undo || !reload {
+		return 0
+	}
+	bin := os.Getenv("WOSH_BIN_DIR")
+	first := strings.SplitN(os.Getenv("PATH"), string(os.PathListSeparator), 2)[0]
+	if !changed && bin != "" && first == bin {
+		return 0 // already effective in this shell
+	}
+	sh := shell
+	if p, err := exec.LookPath(shell); err == nil {
+		sh = p
+	}
+	reloadCmd := "exec " + sh + " -l"
+	if os.Getenv("WOSH_SOCK") != "" && term.IsTerminal(int(os.Stdin.Fd())) {
+		// we cannot reload the shell that started us, but the session
+		// daemon can type for us: the shell runs it once we exit
+		if err := stream.TypeIntoSession(reloadCmd + "\r"); err == nil {
+			fmt.Println("wosh: reloading your shell...")
+			return 0
+		}
+	}
+	fmt.Printf("wosh: reload your shell to apply: %s\n", reloadCmd)
+	return 0
 }

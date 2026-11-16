@@ -1,6 +1,9 @@
 package wire
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"encoding/json"
+)
 
 // Data channel frame types. Every frame is one data channel message whose
 // first byte is the type.
@@ -15,6 +18,7 @@ const (
 	FExit    = 'x' // S->C  i32 exit status
 	FExitAck = 'X' // C->S
 	FKill    = 'k' // C->S  hang up the session
+	FControl = 'c' // both  JSON control message (see Control)
 )
 
 // MaxChunk is the largest payload we put in one frame.
@@ -71,4 +75,33 @@ func ParseExit(b []byte) int {
 		return 255
 	}
 	return int(int32(binary.BigEndian.Uint32(b[1:])))
+}
+
+// Control is a JSON control message on the main channel.
+type Control struct {
+	Op    string      `json:"op"`              // info (S->C), rfwd (C->S)
+	Token string      `json:"token,omitempty"` // info: session token for chained hops
+	Rfwd  []RemoteFwd `json:"rfwd,omitempty"`  // rfwd: remote forwards to listen on
+}
+
+// RemoteFwd is a -R forward: the daemon listens on Bind:Port.
+type RemoteFwd struct {
+	ID   int    `json:"id"`
+	Bind string `json:"bind"`
+	Port int    `json:"port"`
+}
+
+// ControlFrame encodes a control message.
+func ControlFrame(c Control) []byte {
+	b, _ := json.Marshal(c)
+	return append([]byte{FControl}, b...)
+}
+
+// ParseControl decodes a control frame.
+func ParseControl(b []byte) (Control, bool) {
+	var c Control
+	if len(b) < 2 || json.Unmarshal(b[1:], &c) != nil {
+		return c, false
+	}
+	return c, true
 }

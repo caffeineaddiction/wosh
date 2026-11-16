@@ -208,7 +208,8 @@ func RunRelay(o RelayOptions) error {
 				}
 			}
 		case _, ok := <-dmsgs:
-			if !ok { // daemon exited: session over
+			if !ok { // daemon exited: session over (tell a chained-hop relay)
+				_, _ = o.Out.Write(wire.EncodeOSC(wire.Msg{T: wire.TBye, ID: id}))
 				return nil
 			}
 		}
@@ -242,6 +243,11 @@ func spawnDaemon(id string, command []string, linger time.Duration) error {
 	defer r.Close()
 
 	args := []string{"_daemon", "--id", id, "--linger", linger.String()}
+	if p := os.Getenv("WOSH_UNLINK"); p != "" {
+		// pushed temp file (no memfd): the daemon keeps it in the session's
+		// private bin dir for `wosh`/shims and deletes it with the session
+		args = append(args, "--own-binary", p)
+	}
 	if len(command) > 0 {
 		args = append(args, "--")
 		args = append(args, command...)
@@ -269,11 +275,6 @@ func spawnDaemon(id string, command []string, linger time.Duration) error {
 	case err := <-ready:
 		if err != nil {
 			return fmt.Errorf("daemon failed to start (see %s)", logf.Name())
-		}
-		// A pushed binary that had to be written to a file (no memfd, e.g.
-		// macOS) is deleted as soon as the daemon is running from it.
-		if p := os.Getenv("WOSH_UNLINK"); p != "" {
-			_ = os.Remove(p)
 		}
 		return nil
 	case <-time.After(10 * time.Second):

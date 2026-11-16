@@ -13,6 +13,7 @@ import (
 	"github.com/pion/webrtc/v4"
 
 	"wosh/internal/rtc"
+	"wosh/internal/stream"
 	"wosh/internal/wire"
 )
 
@@ -27,15 +28,20 @@ const (
 
 // Session is one wosh connection to one remote daemon.
 type Session struct {
-	c      *Client
-	id     string
-	key    string
-	host   string
-	user   string
-	parent *Session  // nil: reachable by ssh (root); else signaled through parent's terminal
-	sock   string    // daemon control socket on the remote host
-	path   string    // selected ICE candidate pair, for ~s
-	anchor *pipeWire // bootstrap ssh kept open (macOS LAN permission), closed on finish
+	c         *Client
+	id        string
+	key       string
+	host      string
+	user      string
+	parent    *Session  // nil: reachable by ssh (root); else signaled through parent's terminal
+	sock      string    // daemon control socket on the remote host
+	path      string    // selected ICE candidate pair, for ~s
+	anchor    *pipeWire // bootstrap ssh kept open (macOS LAN permission), closed on finish
+	token     string    // daemon's session token (authenticates chained-hop hellos)
+	delegated bool      // reached via `wosh host` in the parent session (chained hop)
+
+	srcMu      sync.Mutex
+	srcAllowed int // 0 unasked, 1 allowed, -1 denied (src: access from this host)
 
 	mu       sync.Mutex
 	gen      int
@@ -131,6 +137,12 @@ func (s *Session) negotiate(w sigChan) error {
 			_ = pc.Close()
 		}
 	}()
+	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
+		// streams the remote host opens to us: -R forwards, src: transfers
+		if spec, ok := stream.ParseLabel(dc.Label()); ok {
+			go s.c.fromRemote(s, stream.Wrap(dc), spec)
+		}
+	})
 	dc, err := pc.CreateDataChannel("wosh", nil)
 	if err != nil {
 		return err
@@ -174,6 +186,7 @@ func (s *Session) negotiate(w sigChan) error {
 		T: wire.TOffer, ID: s.id, Key: s.key, SDP: pc.LocalDescription().SDP,
 		ICE: s.c.o.ICE, Relay: s.c.o.RelayOnly, Term: s.c.o.Term,
 		Cols: cols, Rows: rows, RxOut: rx,
+		Env: s.c.remoteEnv(), Src: s.c.o.Src, User: localUser(),
 	})
 	if err != nil {
 		return err
@@ -224,6 +237,9 @@ func (s *Session) negotiate(w sigChan) error {
 		pending = pending[n:]
 	}
 	_ = dc.Send(wire.ResizeFrame(cols, rows))
+	if s.parent == nil && len(s.c.rfwds) > 0 {
+		_ = dc.Send(wire.ControlFrame(wire.Control{Op: "rfwd", Rfwd: s.c.rfwds}))
+	}
 	log.Printf("[%s] connected gen %d", s.id, gen)
 	return nil
 }
@@ -335,6 +351,12 @@ func (s *Session) onFrame(gen int, b []byte) {
 			s.inBase += drop
 		}
 		s.mu.Unlock()
+	case wire.FControl:
+		if c, ok := wire.ParseControl(b); ok && c.Op == "info" {
+			s.mu.Lock()
+			s.token = c.Token
+			s.mu.Unlock()
+		}
 	case wire.FPong:
 	case wire.FExit:
 		code := wire.ParseExit(b)
@@ -381,6 +403,10 @@ func (s *Session) finish(code int) {
 		s.mu.Unlock()
 		close(s.done)
 		log.Printf("[%s] exited %d", s.id, code)
+		if s.delegated && s.parent != nil {
+			// release the `wosh host` process parked in the parent's terminal
+			s.parent.sendInput(wire.EncodeInput(wire.Msg{T: wire.TBye, ID: s.id}))
+		}
 		if s.anchor != nil {
 			go s.anchor.close()
 		}
@@ -496,4 +522,17 @@ func (s *Session) reconnect() error {
 		return fmt.Errorf("unexpected %q from remote", hello.T)
 	}
 	return s.negotiate(w)
+}
+
+// openStream opens a stream to this session's host (waits for a connection).
+func (s *Session) openStream(spec wire.StreamSpec) (*stream.Chan, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := s.waitAlive(ctx); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	pc := s.pc
+	s.mu.Unlock()
+	return stream.Open(pc, spec)
 }

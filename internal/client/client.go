@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"os/user"
 	"slices"
 	"sort"
 	"strings"
@@ -35,9 +36,13 @@ type Options struct {
 	RelayOnly bool
 	Auto      bool // accept in-band upgrade requests without asking
 	Term      string
-	Resume    string // "id:key" of a detached root session to reattach to
-	Push      bool   // remote side via perl stub: use a compatible installed wosh, else upload one (CLI default)
-	ForcePush bool   // upload even if a compatible wosh is installed
+	Resume    string            // "id:key" of a detached root session to reattach to
+	Env       map[string]string // extra variables for remote session shells (--env)
+	Src       string            // host alias for the client in remote sessions ("src")
+	AllowSrc  bool              // don't ask before serving src: requests
+	Forwards  []Forward         // -L / -R / -D
+	Push      bool              // remote side via perl stub: use a compatible installed wosh, else upload one (CLI default)
+	ForcePush bool              // upload even if a compatible wosh is installed
 
 	In  io.Reader
 	Out io.Writer
@@ -54,6 +59,7 @@ type Client struct {
 	stack []*Session
 
 	rootPending *Session // connected but not yet shown (see begin)
+	rfwds       []wire.RemoteFwd
 
 	outMu      sync.Mutex
 	status     string
@@ -83,8 +89,7 @@ func Run(o Options) (int, error) {
 	return c.Wait(), nil
 }
 
-// Start bootstraps the root session over ssh (may prompt for passwords).
-func Start(o Options) (*Client, error) {
+func (o *Options) setDefaults() {
 	if o.In == nil {
 		o.In = os.Stdin
 	}
@@ -103,7 +108,18 @@ func Start(o Options) (*Client, error) {
 	if o.ICE == nil {
 		o.ICE = []wire.ICEServer{{URLs: rtc.DefaultSTUN}}
 	}
+	if o.Src == "" {
+		o.Src = "src"
+	}
+}
+
+// Start bootstraps the root session over ssh (may prompt for passwords).
+func Start(o Options) (*Client, error) {
+	o.setDefaults()
 	c := &Client{o: o, api: rtc.NewAPI(), errOut: o.Err, finished: make(chan struct{}), ttyFd: -1}
+	if err := c.prepareForwards(); err != nil {
+		return nil, err
+	}
 	if f, ok := o.Out.(*os.File); ok && term.IsTerminal(int(f.Fd())) {
 		c.ttyFd = int(f.Fd())
 	}
@@ -122,6 +138,7 @@ func (c *Client) begin() {
 	if r := c.rootPending; r != nil {
 		c.rootPending = nil
 		c.push(r)
+		c.startForwards(r)
 	}
 	go c.inputLoop()
 	go c.winchLoop()
@@ -146,31 +163,9 @@ func (c *Client) connectRoot() (*Session, error) {
 		}
 		remote = []string{"attach", rid}
 	}
-	w, hello, err := c.bootstrap(remote)
-	if err != nil && c.o.Push && w != nil {
-		// Push is the default; fall back to an installed wosh when the remote
-		// has no perl (exit 127) or we have no build for its platform.
-		pe, _ := w.pushErr.Load().(error)
-		if w.exitCode() == 127 || pe != nil {
-			why := "no perl on remote"
-			if pe != nil {
-				why = pe.Error()
-			}
-			fmt.Fprintf(c.errOut, "wosh: cannot push (%s); trying installed wosh\n", why)
-			c.o.Push = false
-			w, hello, err = c.bootstrap(remote)
-		}
-	}
+	w, hello, err := c.startRemote(remote)
 	if err != nil {
 		return nil, err
-	}
-	if hello.T == wire.TError {
-		w.close()
-		return nil, fmt.Errorf("remote: %s", hello.Err)
-	}
-	if hello.T != wire.THello {
-		w.close()
-		return nil, fmt.Errorf("unexpected %q from remote", hello.T)
 	}
 	s := newSession(c, hello.ID, hello.Host, hello.User, nil)
 	s.sock = hello.Sock
@@ -199,6 +194,38 @@ func (c *Client) connectRoot() (*Session, error) {
 		return nil, err
 	}
 	return s, nil
+}
+
+// startRemote runs the remote relay over ssh (pushing / falling back to an
+// installed wosh as needed) and returns its hello.
+func (c *Client) startRemote(remote []string) (*pipeWire, wire.Msg, error) {
+	w, hello, err := c.bootstrap(remote)
+	if err != nil && c.o.Push && w != nil {
+		// fall back to an installed wosh when the remote has no perl (exit
+		// 127) or we have no build for its platform
+		pe, _ := w.pushErr.Load().(error)
+		if w.exitCode() == 127 || pe != nil {
+			why := "no perl on remote"
+			if pe != nil {
+				why = pe.Error()
+			}
+			fmt.Fprintf(c.errOut, "wosh: cannot push (%s); trying installed wosh\n", why)
+			c.o.Push = false
+			w, hello, err = c.bootstrap(remote)
+		}
+	}
+	if err != nil {
+		return nil, wire.Msg{}, err
+	}
+	if hello.T == wire.TError {
+		w.close()
+		return nil, wire.Msg{}, fmt.Errorf("remote: %s", hello.Err)
+	}
+	if hello.T != wire.THello {
+		w.close()
+		return nil, wire.Msg{}, fmt.Errorf("unexpected %q from remote", hello.T)
+	}
+	return w, hello, nil
 }
 
 // bootstrap runs the remote relay over ssh and waits for its hello.
@@ -298,11 +325,17 @@ func (c *Client) onHello(parent *Session, m wire.Msg) {
 		if m.User != "" {
 			name = m.User + "@" + m.Host
 		}
-		if !c.o.Auto && !c.ask(fmt.Sprintf("upgrade to direct wosh connection to %s? [y/N] ", name)) {
+		parent.mu.Lock()
+		trusted := m.Token != "" && parent.token != "" && m.Token == parent.token
+		parent.mu.Unlock()
+		// a chained hop (`wosh host` run inside this session) proves itself
+		// with the session token; anything else printing a hello must ask
+		if !trusted && !c.o.Auto && !c.ask(fmt.Sprintf("upgrade to direct wosh connection to %s? [y/N] ", name)) {
 			parent.sendInput(wire.EncodeInput(wire.Msg{T: wire.TBye, ID: m.ID}))
 			return
 		}
 		child := newSession(c, m.ID, m.Host, m.User, parent)
+		child.delegated = trusted
 		w := newParentWire(parent, m.ID)
 		err := child.negotiate(w)
 		w.close()
@@ -587,4 +620,27 @@ func (c *Client) dropAll(why string) {
 	for _, s := range all {
 		s.markDead(0, why)
 	}
+}
+
+// remoteEnv: variables for remote shells - locale and color hints (like
+// mosh/ssh SendEnv defaults) plus --env.
+func (c *Client) remoteEnv() map[string]string {
+	env := map[string]string{}
+	for _, e := range os.Environ() {
+		k, v, _ := strings.Cut(e, "=")
+		if k == "LANG" || k == "LANGUAGE" || strings.HasPrefix(k, "LC_") || k == "COLORTERM" {
+			env[k] = v
+		}
+	}
+	for k, v := range c.o.Env {
+		env[k] = v
+	}
+	return env
+}
+
+func localUser() string {
+	if u, err := user.Current(); err == nil {
+		return u.Username
+	}
+	return os.Getenv("USER")
 }
