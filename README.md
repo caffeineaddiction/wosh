@@ -88,18 +88,39 @@ technique and may be flagged by EDR; `vm.memfd_noexec=2` disables it.
 
 Like mosh, wosh echoes what you type locally before the server confirms
 it. A terminal emulator mirrors the remote screen (cells, widths, cursor),
-so printable keys and backspace are drawn at the predicted position
-immediately - underlined while the round trip is > 80 ms or the link is
-down - and reconciled when the server's echo arrives: a prediction is
-confirmed only when the server has received that keystroke and drawn the
-same character there, anything else withdraws it. Each stretch of typing
-starts tentative (nothing shown until the server echoes one key of it), so
-password prompts and editor commands (vim normal mode) never show
-predicted text, while typing in shells, vim insert mode and nano does.
-Typing mid-line is predicted as an insertion (the rest of the line shifts
-right), predictions wrap at the right margin (not on the bottom row, which
-would scroll) and handle double-width characters (CJK, emoji). Text a
-shell draws by itself (fish autosuggestions) never confirms a prediction.
+and keystrokes are applied to a predicted copy of the screen:
+
+| keys | shells (readline, fish, ...) | vim / nano (alternate screen) |
+|---|---|---|
+| printable | insert at the cursor | insert at the cursor |
+| Backspace, Delete | delete, shift the rest of the line | same |
+| Left / Right | move the cursor | same (incl. `ESC O D/C`) |
+| Home / End, Ctrl-A / Ctrl-E | start of input / end of text | column 0 / end of text (Ctrl-A/E not predicted) |
+| Alt-B, Ctrl-Left / Alt-F, Ctrl-Right | previous word start / next word end | previous / next word start |
+| Ctrl-W, Alt-Backspace | delete back to whitespace / previous word | not predicted |
+| Up / Down | not predicted (history) | move a line, keeping the wanted column |
+
+The "start of input" is learned from the cursor at the first key on a fresh
+prompt (after Enter, Ctrl-C, Ctrl-U or Ctrl-L). In vim's normal mode the
+cursor is kept on the last character of short lines; with `-- INSERT --`
+showing, or in nano, it may sit after the text. Changed cells and the
+predicted cursor are drawn immediately - typed text underlined while the
+round trip is > 80 ms or the link is down.
+
+The server sends echo acks (as mosh does): which input the application
+has had at least 50 ms to answer, after the output it produced. Only then
+is a prediction judged - typed cells must show the typed character and the
+cursor must be where predicted - so text an app draws by itself (fish
+autosuggestions) never confirms a keystroke; anything else is withdrawn.
+Each stretch of typing starts tentative: typed text is shown once a typed
+character of it has been confirmed, cursor movement once a predicted
+cursor position has been - so password prompts and editor commands (vim
+normal mode) never show predicted text, while navigation does. Enter, Tab,
+shell Up/Down and other control keys are not predicted, and nothing after
+them is until the server has processed them. Apps with different word
+rules (fish treats punctuation as word boundaries) just get their
+predictions withdrawn after one round trip. Wide characters (CJK, emoji) and wrapping at
+the right margin (not on the bottom row) are handled.
 
 `--predict=adaptive` (default: when the smoothed round trip is > 30 ms or
 the link is down), `always`, `never`; env `WOSH_PREDICT`. Unlike mosh, the
@@ -188,8 +209,8 @@ the selected candidate pair.
 * Reconnecting the root needs non-interactive ssh auth (keys/agent).
 * Hops reached with plain ssh still need `wosh up` and an installed wosh;
   use `wosh host` from inside a session instead (chained hop).
-* Prediction covers printable keys and backspace; cursor keys, Enter and
-  other control keys start a new (tentative) stretch.
+* Word movement follows readline rules in shells; fish's own rules differ
+  (mispredictions are withdrawn, not left on screen).
 * A chained hop ends the intermediate host's forwarded connections (by
   design); new connections go to the new destination.
 * tmux/screen on an intermediate hop swallow unknown OSC (use passthrough).

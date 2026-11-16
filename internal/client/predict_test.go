@@ -59,7 +59,10 @@ func TestPredictionEndToEnd(t *testing.T) {
 		t.Fatalf("build: %v\n%s", err, out)
 	}
 	t.Setenv("WOSH_RUNTIME_DIR", filepath.Join(tmp, "rt"))
-	t.Setenv("SHELL", "/bin/sh")
+	// bash with readline (line editing: cursor keys, Delete), no rc files
+	sh := filepath.Join(tmp, "testsh")
+	_ = os.WriteFile(sh, []byte("#!/bin/sh\nexec /bin/bash --noprofile --norc -i\n"), 0o755)
+	t.Setenv("SHELL", sh)
 	t.Setenv("ENV", "")
 	t.Setenv("PS1", "$ ")
 	t.Setenv("HOME", tmp)
@@ -99,13 +102,15 @@ func TestPredictionEndToEnd(t *testing.T) {
 	waitScreen("\nabcdXY")
 	slowType("echo 日本語 wide\r")
 	waitScreen("\n日本語 wide")
+	slowType("echo abXcd\x1b[D\x1b[D\x1b[D\x7fY\x1b[3~\x1b[C\r") // edit mid-line
+	waitScreen("\naYcd")
 	time.Sleep(300 * time.Millisecond)
 	var lines []string
 	for _, l := range strings.Split(screen.screen(), "\n") {
 		lines = append(lines, strings.TrimRight(l, " "))
 	}
 	got := strings.Join(lines, "\n")
-	for _, want := range []string{"$ echo predicted-text\n", "$ echo abcdXY\n", "$ echo 日本語 wide\n"} {
+	for _, want := range []string{"$ echo predicted-text\n", "$ echo abcdXY\n", "$ echo 日本語 wide\n", "$ echo aYcd\n"} {
 		if strings.Count(got, want) != 1 {
 			t.Fatalf("expected exactly one %q on screen:\n%s", want, got)
 		}

@@ -19,6 +19,8 @@ const (
 	FExitAck = 'X' // C->S
 	FKill    = 'k' // C->S  hang up the session
 	FControl = 'c' // both  JSON control message (see Control)
+	FEchoAck = 'e' // S->C  u64: input up to here reached the app >= 50ms ago and
+	//                       any output it caused was sent before this frame
 )
 
 // MaxChunk is the largest payload we put in one frame.

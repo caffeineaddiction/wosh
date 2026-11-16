@@ -75,6 +75,8 @@ type Daemon struct {
 	baseDir    string // <runtime>/<id>.d
 	binDir     string // session bin dir (wosh + shims), first in PATH
 	rfwd       map[int]net.Listener
+	inLog      []inputMark // input written to the pty, for echo acks
+	echoed     uint64
 	streams    *stream.Registry
 
 	kick chan struct{}
@@ -89,6 +91,7 @@ type peer struct {
 	sent    uint64
 	open    bool
 	exitOut bool
+	echoOut uint64 // last echo ack sent to this peer
 	low     chan struct{}
 }
 
@@ -452,7 +455,7 @@ func (d *Daemon) sender() {
 		case <-d.quit:
 			return
 		case <-d.kick:
-		case <-time.After(500 * time.Millisecond):
+		case <-time.After(d.senderWait()):
 		}
 		for d.sendSome() {
 		}
@@ -478,6 +481,14 @@ func (d *Daemon) sendSome() bool {
 	}
 	data, off := d.out.slice(p.sent, wire.MaxChunk)
 	if len(data) == 0 {
+		// output is caught up: report which input the app has had time to
+		// answer (mosh's echo ack) so the client can judge its predictions
+		if echo := d.echoAckLocked(); echo > p.echoOut {
+			p.echoOut = echo
+			d.mu.Unlock()
+			_ = p.dc.Send(wire.U64Frame(wire.FEchoAck, echo))
+			return true
+		}
 		if d.exitSent && !p.exitOut {
 			p.exitOut = true
 			code := d.exitCode
@@ -641,6 +652,10 @@ func (d *Daemon) onFrame(p *peer, b []byte) {
 		if ptmx != nil {
 			_, _ = ptmx.Write(data)
 		}
+		d.mu.Lock()
+		d.inLog = append(d.inLog, inputMark{off: rx, at: time.Now()})
+		d.mu.Unlock()
+		d.poke()
 		_ = p.dc.Send(wire.U64Frame(wire.FAck, rx))
 	case wire.FResize:
 		if cols, rows, ok := wire.ParseResize(b); ok && cols > 0 && rows > 0 {
@@ -823,4 +838,40 @@ func (d *Daemon) listenAgent() (string, error) {
 		}
 	}()
 	return sock, nil
+}
+
+// echoDelay: how long the application gets to echo a keystroke before the
+// client may judge its prediction (mosh uses 50ms).
+const echoDelay = 50 * time.Millisecond
+
+type inputMark struct {
+	off uint64
+	at  time.Time
+}
+
+// echoAckLocked returns the input offset that reached the pty at least
+// echoDelay ago (d.mu held).
+func (d *Daemon) echoAckLocked() uint64 {
+	cut := time.Now().Add(-echoDelay)
+	var echo uint64
+	i := 0
+	for i < len(d.inLog) && !d.inLog[i].at.After(cut) {
+		echo = d.inLog[i].off
+		i++
+	}
+	if i > 0 {
+		d.inLog = d.inLog[i:]
+		d.echoed = echo
+	}
+	return d.echoed
+}
+
+// senderWait: wake up soon while echo acks are pending.
+func (d *Daemon) senderWait() time.Duration {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if len(d.inLog) > 0 {
+		return 10 * time.Millisecond
+	}
+	return 500 * time.Millisecond
 }

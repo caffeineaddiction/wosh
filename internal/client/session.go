@@ -381,6 +381,12 @@ func (s *Session) onFrame(gen int, b []byte) {
 			s.inBase += drop
 		}
 		s.mu.Unlock()
+	case wire.FEchoAck:
+		if off, _, ok := wire.ParseOffset(b); ok && s.c.pred != nil && s.c.isTop(s) {
+			s.c.outMu.Lock()
+			_, _ = s.c.o.Out.Write(s.c.pred.EchoAck(off))
+			s.c.outMu.Unlock()
+		}
 	case wire.FControl:
 		if c, ok := wire.ParseControl(b); ok && c.Op == "info" {
 			s.mu.Lock()
