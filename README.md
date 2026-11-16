@@ -84,6 +84,26 @@ technique and may be flagged by EDR; `vm.memfd_noexec=2` disables it.
   disappearing trigger reconnect. Root sessions re-run ssh (`BatchMode`) with
   `attach`; nested sessions wait for their parent, then signal through it.
 
+## Typing on slow links (predictive echo)
+
+Like mosh, wosh echoes what you type locally before the server confirms
+it. A terminal emulator mirrors the remote screen, so printable keys (and
+backspace) are drawn at the predicted cursor position immediately -
+underlined while the round trip is > 80 ms or the link is down - and
+reconciled when the server's echo arrives: matching cells confirm the
+prediction, anything else withdraws it. Each line starts tentative: nothing
+is predicted until the server has echoed one keystroke of it, so password
+prompts and non-echoing programs never show predicted text.
+
+`--predict=adaptive` (default: when the smoothed round trip is > 30 ms or
+the link is down), `always`, `never`; env `WOSH_PREDICT`. Unlike mosh, the
+raw output still reaches your terminal (scrollback works); predictions
+are drawn with relative cursor moves only. `~s` shows each session's rtt.
+
+Keystrokes are never lost: input is offset-acknowledged and resent after
+reconnects, and keys typed while a chained hop is being set up are
+forwarded to the new session in order (typeahead).
+
 ## Inside a session
 
 * **Environment**: `LANG`, `LC_*`, `COLORTERM` are forwarded; `--env=K=V`
@@ -160,6 +180,8 @@ the selected candidate pair.
 * Reconnecting the root needs non-interactive ssh auth (keys/agent).
 * Hops reached with plain ssh still need `wosh up` and an installed wosh;
   use `wosh host` from inside a session instead (chained hop).
+* Prediction covers printable keys and backspace on the current line (no
+  wide characters, line wrap or alternate-screen apps yet).
 * A chained hop ends the intermediate host's forwarded connections (by
   design); new connections go to the new destination.
 * tmux/screen on an intermediate hop swallow unknown OSC (use passthrough).

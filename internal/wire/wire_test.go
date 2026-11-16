@@ -2,6 +2,7 @@ package wire
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 )
 
@@ -58,5 +59,28 @@ func TestFrames(t *testing.T) {
 	}
 	if ParseExit(ExitFrame(-3)) != -3 {
 		t.Fatal("exit frame")
+	}
+}
+
+func TestInputSplitter(t *testing.T) {
+	msg := EncodeInput(Msg{T: TOffer, ID: "x"})
+	stream := append([]byte("ls -la\rWO"), msg...) // "WO" typed, then a message
+	stream = append(stream, []byte("WOSHY not a msg")...)
+	for chunk := 1; chunk <= len(stream); chunk++ {
+		var sp InputSplitter
+		var other []byte
+		var msgs []Msg
+		for i := 0; i < len(stream); i += chunk {
+			m, o := sp.Feed(stream[i:min(i+chunk, len(stream))])
+			msgs, other = append(msgs, m...), append(other, o...)
+		}
+		m, o := sp.Feed(nil)
+		msgs, other = append(msgs, m...), append(other, o...)
+		if len(msgs) != 1 || msgs[0].ID != "x" {
+			t.Fatalf("chunk %d: msgs %+v", chunk, msgs)
+		}
+		if !strings.HasPrefix(string(other), "ls -la\rWO") || !strings.Contains(string(other), "Y not a msg") {
+			t.Fatalf("chunk %d: other %q", chunk, other)
+		}
 	}
 }

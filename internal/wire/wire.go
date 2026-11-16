@@ -34,16 +34,17 @@ const (
 
 // Message types.
 const (
-	THello  = "hello"  // relay -> client: a wosh daemon is ready to be connected to
-	TOffer  = "offer"  // client -> relay: SDP offer
-	TAnswer = "answer" // relay -> client: SDP answer
-	TError  = "err"    // relay -> client: negotiation failed
-	TBye    = "bye"    // client -> relay: client declined / is done
-	TPark   = "park"   // relay -> daemon: I stay connected as the client's ssh anchor
-	TOpen   = "open"   // shim -> daemon: open a stream to the client, then raw frames
-	TInfo   = "info"   // shim -> daemon: who is the client (reply carries User)
-	TType   = "type"   // local tool -> daemon: type Text into the session (e.g. reload the shell)
-	TOK     = "ok"
+	THello     = "hello"     // relay -> client: a wosh daemon is ready to be connected to
+	TOffer     = "offer"     // client -> relay: SDP offer
+	TAnswer    = "answer"    // relay -> client: SDP answer
+	TError     = "err"       // relay -> client: negotiation failed
+	TBye       = "bye"       // client -> relay: client declined / is done
+	TTypeahead = "typeahead" // relay -> client: keystrokes that reached the relay's tty (Text: base64)
+	TPark      = "park"      // relay -> daemon: I stay connected as the client's ssh anchor
+	TOpen      = "open"      // shim -> daemon: open a stream to the client, then raw frames
+	TInfo      = "info"      // shim -> daemon: who is the client (reply carries User)
+	TType      = "type"      // local tool -> daemon: type Text into the session (e.g. reload the shell)
+	TOK        = "ok"
 )
 
 // ICEServer mirrors webrtc.ICEServer without importing pion here.
@@ -223,3 +224,55 @@ func (f *OSCFilter) Write(p []byte) (out []byte, msgs []Msg) {
 // Pending reports whether the filter is holding back bytes that may turn out
 // to be a wosh message prefix.
 func (f *OSCFilter) Pending() bool { return len(f.held) > 0 || f.inMsg }
+
+// InputSplitter separates "WOSH:<b64>" lines injected by the client from
+// keystrokes the user typed into the same tty (typeahead).
+type InputSplitter struct {
+	buf []byte
+}
+
+// Feed returns messages and any other bytes, in arrival order of the latter.
+func (s *InputSplitter) Feed(p []byte) (msgs []Msg, other []byte) {
+	s.buf = append(s.buf, p...)
+	for len(s.buf) > 0 {
+		i := bytes.Index(s.buf, []byte(inputPrefix))
+		if i < 0 {
+			// keep a tail that may be the start of a prefix
+			keep := 0
+			for k := min(len(inputPrefix)-1, len(s.buf)); k > 0; k-- {
+				if bytes.HasSuffix(s.buf, []byte(inputPrefix[:k])) {
+					keep = k
+					break
+				}
+			}
+			other = append(other, s.buf[:len(s.buf)-keep]...)
+			s.buf = s.buf[len(s.buf)-keep:]
+			return msgs, other
+		}
+		other = append(other, s.buf[:i]...)
+		s.buf = s.buf[i:]
+		j := bytes.IndexAny(s.buf, "\r\n")
+		if j < 0 {
+			if len(s.buf) > maxPayload {
+				s.buf = nil
+			}
+			return msgs, other
+		}
+		if m, err := decode(string(s.buf[len(inputPrefix):j])); err == nil {
+			msgs = append(msgs, m)
+		}
+		s.buf = s.buf[j+1:]
+	}
+	return msgs, other
+}
+
+// FlushPartial returns held bytes that only looked like the start of a
+// message prefix (call when input has gone quiet).
+func (s *InputSplitter) FlushPartial() []byte {
+	if len(s.buf) == 0 || bytes.HasPrefix(s.buf, []byte(inputPrefix)) {
+		return nil
+	}
+	b := s.buf
+	s.buf = nil
+	return b
+}

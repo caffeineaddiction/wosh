@@ -280,6 +280,7 @@ func TestFeatures(t *testing.T) {
 
 	t.Run("chained hop", func(t *testing.T) {
 		typ("wosh --local=" + bin + " ignored-host")
+		typ(`echo "early-$WOSH_SESSION"`) // typed before the hop exists: must run on the new host
 		deadline := time.Now().Add(30 * time.Second)
 		for c.top() == root && time.Now().Before(deadline) {
 			time.Sleep(50 * time.Millisecond)
@@ -291,6 +292,10 @@ func TestFeatures(t *testing.T) {
 		child := c.top()
 		if !child.delegated || len(child.route) != 2 {
 			t.Fatalf("child not a routed hop: %+v", child.route)
+		}
+		waitFor(t, out, "early-"+child.id, 20*time.Second)
+		if strings.Contains(out.String(), "early-"+root.id) {
+			t.Fatal("typeahead ran on the intermediate host")
 		}
 		typ(`echo "hop-$WOSH_SESSION"`)
 		waitFor(t, out, "hop-"+child.id, 20*time.Second)

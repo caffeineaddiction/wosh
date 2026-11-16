@@ -22,6 +22,7 @@ import (
 	"github.com/pion/webrtc/v4"
 	"golang.org/x/term"
 
+	"wosh/internal/predict"
 	"wosh/internal/rtc"
 	"wosh/internal/wire"
 )
@@ -42,6 +43,7 @@ type Options struct {
 	AllowSrc  bool              // don't ask before serving src: requests
 	Forwards  []Forward         // -L / -R / -D
 	Agent     bool              // -A: forward ssh-agent to the current destination
+	Predict   predict.Mode      // local echo prediction (mosh-style)
 	Push      bool              // remote side via perl stub: use a compatible installed wosh, else upload one (CLI default)
 	ForcePush bool              // upload even if a compatible wosh is installed
 
@@ -60,6 +62,8 @@ type Client struct {
 	stack []*Session
 
 	rootPending *Session // connected but not yet shown (see begin)
+	pending     *Session // chained hop being set up: keystrokes go here
+	pred        *predict.Engine
 	rfwds       []wire.RemoteFwd
 
 	outMu      sync.Mutex
@@ -118,6 +122,11 @@ func (o *Options) setDefaults() {
 func Start(o Options) (*Client, error) {
 	o.setDefaults()
 	c := &Client{o: o, api: rtc.NewAPI(), errOut: o.Err, finished: make(chan struct{}), ttyFd: -1}
+	if f, ok := o.Out.(*os.File); ok && term.IsTerminal(int(f.Fd())) {
+		c.ttyFd = int(f.Fd())
+	}
+	cols, rows := c.size()
+	c.pred = predict.New(o.Predict, int(cols), int(rows))
 	if err := c.prepareForwards(); err != nil {
 		return nil, err
 	}
@@ -144,6 +153,7 @@ func (c *Client) begin() {
 	go c.inputLoop()
 	go c.winchLoop()
 	go c.netWatch()
+	go c.predictLoop()
 }
 
 // Wait blocks until all sessions are over (or the user quit/detached).
@@ -252,7 +262,11 @@ func (c *Client) push(s *Session) {
 	s.outMu.Lock()
 	c.mu.Lock()
 	c.stack = append(c.stack, s)
+	if c.pending == s {
+		c.pending = nil
+	}
 	c.mu.Unlock()
+	c.resetPrediction()
 	// output that arrived before the session was on screen (e.g. the
 	// shell's startup queries, motd, first prompt) is shown now
 	s.shown = true
@@ -322,6 +336,7 @@ func (c *Client) remove(s *Session) {
 	}
 	if wasTop {
 		c.clearStatus()
+		c.resetPrediction()
 		cols, rows := c.size()
 		next.send(wire.ResizeFrame(cols, rows))
 		c.updateStatus()
@@ -342,22 +357,30 @@ func (c *Client) onHello(parent *Session, m wire.Msg) {
 		log.Printf("ignoring hello from background session %s", parent.id)
 		return
 	}
+	name := m.Host
+	if m.User != "" {
+		name = m.User + "@" + m.Host
+	}
+	parent.mu.Lock()
+	trusted := m.Token != "" && parent.token != "" && m.Token == parent.token
+	parent.mu.Unlock()
+	child := newSession(c, m.ID, m.Host, m.User, parent)
+	child.delegated = trusted
+	if trusted {
+		// synchronously, before the next message from this stream (typeahead)
+		// is handled: from now on keystrokes belong to the new session
+		// (queued until it connects); earlier ones arrive as typeahead
+		c.mu.Lock()
+		c.pending = child
+		c.mu.Unlock()
+	}
 	go func() {
-		name := m.Host
-		if m.User != "" {
-			name = m.User + "@" + m.Host
-		}
-		parent.mu.Lock()
-		trusted := m.Token != "" && parent.token != "" && m.Token == parent.token
-		parent.mu.Unlock()
 		// a chained hop (`wosh host` run inside this session) proves itself
 		// with the session token; anything else printing a hello must ask
 		if !trusted && !c.o.Auto && !c.ask(fmt.Sprintf("upgrade to direct wosh connection to %s? [y/N] ", name)) {
 			parent.sendInput(wire.EncodeInput(wire.Msg{T: wire.TBye, ID: m.ID}))
 			return
 		}
-		child := newSession(c, m.ID, m.Host, m.User, parent)
-		child.delegated = trusted
 		child.sock = m.Sock
 		if trusted && m.Hop != nil && parent.route != nil {
 			// reachable without the parent session: ssh through the same hosts
@@ -367,6 +390,17 @@ func (c *Client) onHello(parent *Session, m wire.Msg) {
 		err := child.negotiate(w)
 		w.close()
 		if err != nil {
+			c.mu.Lock()
+			if c.pending == child {
+				c.pending = nil
+			}
+			c.mu.Unlock()
+			child.mu.Lock()
+			queued := append([]byte(nil), child.inBuf...)
+			child.mu.Unlock()
+			if len(queued) > 0 {
+				parent.sendInput(queued) // don't lose what was typed meanwhile
+			}
 			c.notice("upgrade to %s failed: %v", name, err)
 			parent.sendInput(wire.EncodeInput(wire.Msg{T: wire.TBye, ID: m.ID}))
 			return
@@ -389,8 +423,56 @@ func (c *Client) onHello(parent *Session, m wire.Msg) {
 
 func (c *Client) writeOut(p []byte) {
 	c.outMu.Lock()
-	_, _ = c.o.Out.Write(p)
+	c.emit(p)
 	c.outMu.Unlock()
+}
+
+// emit writes screen output (caller holds outMu). It goes through the
+// prediction engine, which mirrors the screen and redraws predictions.
+func (c *Client) emit(p []byte) {
+	if c.pred != nil {
+		p = c.pred.Output(p)
+	}
+	_, _ = c.o.Out.Write(p)
+}
+
+func (c *Client) resetPrediction() {
+	if c.pred == nil {
+		return
+	}
+	cols, rows := c.size()
+	c.outMu.Lock()
+	_, _ = c.o.Out.Write(c.pred.Reset(int(cols), int(rows)))
+	c.outMu.Unlock()
+}
+
+func (c *Client) predictLoop() {
+	t := time.NewTicker(50 * time.Millisecond)
+	defer t.Stop()
+	for {
+		select {
+		case <-c.finished:
+			return
+		case <-t.C:
+		}
+		c.outMu.Lock()
+		if b := c.pred.Tick(); len(b) > 0 {
+			_, _ = c.o.Out.Write(b)
+		}
+		c.outMu.Unlock()
+	}
+}
+
+// inputTarget is where keystrokes go: a chained hop being set up, else the
+// top session.
+func (c *Client) inputTarget() *Session {
+	c.mu.Lock()
+	p := c.pending
+	c.mu.Unlock()
+	if p != nil {
+		return p
+	}
+	return c.top()
 }
 
 func (c *Client) size() (uint16, uint16) {
@@ -410,6 +492,9 @@ func (c *Client) winchLoop() {
 			c.dropAll("SIGUSR1")
 			continue
 		}
+		if cols, rows := c.size(); c.pred != nil {
+			c.pred.Resize(int(cols), int(rows))
+		}
 		if s := c.top(); s != nil {
 			cols, rows := c.size()
 			s.send(wire.ResizeFrame(cols, rows))
@@ -421,7 +506,7 @@ func (c *Client) ask(q string) bool {
 	ch := make(chan byte, 1)
 	c.outMu.Lock()
 	c.prompt = ch
-	fmt.Fprintf(c.o.Out, "\r\n\x1b[1m[wosh]\x1b[0m %s", q)
+	c.emit([]byte(fmt.Sprintf("\r\n\x1b[1m[wosh]\x1b[0m %s", q)))
 	c.outMu.Unlock()
 	var b byte
 	select {
@@ -436,7 +521,7 @@ func (c *Client) ask(q string) bool {
 	if yes {
 		ans = "yes"
 	}
-	fmt.Fprintf(c.o.Out, "%s\r\n", ans)
+	c.emit([]byte(ans + "\r\n"))
 	c.outMu.Unlock()
 	return yes
 }
@@ -504,7 +589,13 @@ func (c *Client) inputLoop() {
 				out = append(out, b)
 				lineStart = b == '\r' || b == '\n'
 			}
-			if s := c.top(); s != nil && len(out) > 0 {
+			if s := c.inputTarget(); s != nil && len(out) > 0 {
+				if c.pred != nil && c.isTop(s) {
+					off := s.inputEnd()
+					c.outMu.Lock()
+					_, _ = c.o.Out.Write(c.pred.Input(out, off))
+					c.outMu.Unlock()
+				}
 				s.sendInput(out)
 			}
 		}
@@ -554,7 +645,11 @@ func (c *Client) describe() string {
 		s.mu.Lock()
 		path := s.path
 		s.mu.Unlock()
-		fmt.Fprintf(&b, " %s %d. %s [%s] (%s, %s)\r\n      %s\r\n", marker, i, s.name(), s.id, via, state, path)
+		rtt := ""
+		if d := s.rtt(); d > 0 {
+			rtt = fmt.Sprintf(", rtt %dms", d.Milliseconds())
+		}
+		fmt.Fprintf(&b, " %s %d. %s [%s] (%s, %s%s)\r\n      %s\r\n", marker, i, s.name(), s.id, via, state, rtt, path)
 	}
 	return b.String()
 }
@@ -686,4 +781,34 @@ func localUser() string {
 		return u.Username
 	}
 	return os.Getenv("USER")
+}
+
+// typeahead delivers keystrokes a chained-hop relay read from its tty to
+// the session being set up (or already up) for that hop.
+func (c *Client) typeahead(id string, b []byte) {
+	c.mu.Lock()
+	var target *Session
+	if c.pending != nil && c.pending.id == id {
+		target = c.pending
+	}
+	for _, s := range c.stack {
+		if s.id == id {
+			target = s
+		}
+	}
+	c.mu.Unlock()
+	if target != nil {
+		target.prependInput(b)
+	}
+}
+
+// predictLink tells the prediction engine about link state of the session
+// on screen.
+func (c *Client) predictLink(s *Session, up bool) {
+	if c.pred == nil || !c.isTop(s) {
+		return
+	}
+	c.outMu.Lock()
+	_, _ = c.o.Out.Write(c.pred.SetConnected(up))
+	c.outMu.Unlock()
 }

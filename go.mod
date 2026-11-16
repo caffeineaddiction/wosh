@@ -12,6 +12,7 @@ require (
 
 require (
 	github.com/google/uuid v1.6.0 // indirect
+	github.com/hinshun/vt10x v0.0.0-20220301184237-5011da428d02 // indirect
 	github.com/pion/datachannel v1.6.3 // indirect
 	github.com/pion/dtls/v3 v3.1.15 // indirect
 	github.com/pion/interceptor v0.1.51 // indirect

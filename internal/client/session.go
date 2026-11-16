@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -44,7 +45,11 @@ type Session struct {
 	// intermediate host used). nil: only reachable through parent.
 	route [][]string
 
-	streams *stream.Registry
+	streams       *stream.Registry
+	pings         map[uint64]time.Time
+	srtt          time.Duration
+	connectedOnce bool
+	taLen         int // typeahead bytes at the front of inBuf (not yet connected)
 
 	srcMu      sync.Mutex
 	srcAllowed int // 0 unasked, 1 allowed, -1 denied (src: access from this host)
@@ -83,6 +88,7 @@ func newSession(c *Client, id, host, user string, parent *Session) *Session {
 		deadCh:  make(chan struct{}, 1),
 		done:    make(chan struct{}),
 		streams: stream.NewRegistry(),
+		pings:   map[uint64]time.Time{},
 	}
 }
 
@@ -255,6 +261,10 @@ func (s *Session) negotiate(w sigChan) error {
 		_ = dc.Send(wire.ControlFrame(wire.Control{Op: "rfwd", Rfwd: s.c.rfwds}))
 	}
 	log.Printf("[%s] connected gen %d", s.id, gen)
+	s.mu.Lock()
+	s.connectedOnce = true
+	s.mu.Unlock()
+	s.c.predictLink(s, true)
 	return nil
 }
 
@@ -270,6 +280,7 @@ func (s *Session) markDead(gen int, why string) {
 	pc := s.pc
 	s.mu.Unlock()
 	log.Printf("[%s] dead: %s", s.id, why)
+	s.c.predictLink(s, false)
 	if pc != nil {
 		go pc.Close()
 	}
@@ -358,6 +369,9 @@ func (s *Session) onFrame(gen int, b []byte) {
 		if !ok {
 			return
 		}
+		if s.c.pred != nil && s.c.isTop(s) {
+			s.c.pred.Acked(off)
+		}
 		s.mu.Lock()
 		if off > s.inBase {
 			drop := min(off-s.inBase, uint64(len(s.inBuf)))
@@ -372,6 +386,25 @@ func (s *Session) onFrame(gen int, b []byte) {
 			s.mu.Unlock()
 		}
 	case wire.FPong:
+		if n, _, ok := wire.ParseOffset(b); ok {
+			s.mu.Lock()
+			sent, ok := s.pings[n]
+			delete(s.pings, n)
+			s.mu.Unlock()
+			if ok {
+				d := time.Since(sent)
+				s.mu.Lock()
+				if s.srtt == 0 {
+					s.srtt = d
+				} else {
+					s.srtt = (7*s.srtt + d) / 8
+				}
+				s.mu.Unlock()
+				if s.c.pred != nil && s.c.isTop(s) {
+					s.c.pred.SetRTT(d)
+				}
+			}
+		}
 	case wire.FExit:
 		code := wire.ParseExit(b)
 		s.send([]byte{wire.FExitAck})
@@ -395,6 +428,11 @@ func (s *Session) onSignal(m wire.Msg) {
 	switch m.T {
 	case wire.THello:
 		s.c.onHello(s, m)
+	case wire.TTypeahead:
+		// keystrokes that reached a chained-hop relay in this session's tty
+		if b, err := base64.StdEncoding.DecodeString(m.Text); err == nil {
+			s.c.typeahead(m.ID, b)
+		}
 	case wire.TAnswer, wire.TError:
 		s.mu.Lock()
 		ch := s.waiters[m.ID]
@@ -465,6 +503,12 @@ func (s *Session) heartbeat() {
 			continue
 		}
 		n++
+		s.mu.Lock()
+		if len(s.pings) > 32 {
+			s.pings = map[uint64]time.Time{}
+		}
+		s.pings[n] = time.Now()
+		s.mu.Unlock()
 		s.send(wire.U64Frame(wire.FPing, n))
 	}
 }
@@ -594,4 +638,34 @@ func (s *Session) reconnectRoute() error {
 		return fmt.Errorf("remote: %s", hello.Err)
 	}
 	return s.negotiate(w)
+}
+
+// inputEnd is the input stream offset after everything queued so far.
+func (s *Session) inputEnd() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.inBase + uint64(len(s.inBuf))
+}
+
+func (s *Session) rtt() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.srtt
+}
+
+// prependInput queues bytes ahead of anything not yet sent (typeahead that
+// was typed before keys already queued for a session that is not up yet).
+func (s *Session) prependInput(b []byte) {
+	s.mu.Lock()
+	if !s.connectedOnce && s.inBase == 0 {
+		// after earlier typeahead, before keys routed here since the hello
+		at := min(s.taLen, len(s.inBuf))
+		buf := append(append(append([]byte(nil), s.inBuf[:at]...), b...), s.inBuf[at:]...)
+		s.inBuf = buf
+		s.taLen = at + len(b)
+		s.mu.Unlock()
+		return
+	}
+	s.mu.Unlock()
+	s.sendInput(b)
 }

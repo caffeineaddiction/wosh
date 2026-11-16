@@ -17,6 +17,7 @@ import (
 
 	"wosh/internal/build"
 	"wosh/internal/client"
+	"wosh/internal/predict"
 	"wosh/internal/rtc"
 	"wosh/internal/server"
 	"wosh/internal/shellfix"
@@ -78,6 +79,10 @@ client flags (always --long so they never collide with ssh flags):
   --src=NAME              host name meaning "this client" inside sessions
                           (default src: rsync src:dir ., scp f src:, sftp src)
   --allow-src             serve src: transfers without asking
+  --predict=MODE          local echo of typed text before the server
+                          confirms it (like mosh): adaptive (default, when
+                          the round trip is > 30ms or the link is down),
+                          always, never (env WOSH_PREDICT)
   --resume=ID:KEY         reattach to a detached root session
   --yes                   accept in-band upgrade requests without asking
   --log=FILE              debug log
@@ -192,6 +197,9 @@ func runClient(args []string) int {
 	stun, turn := os.Getenv("WOSH_STUN"), os.Getenv("WOSH_TURN")
 	// push by default; an explicit --server-cmd means "use the installed one"
 	o.Push = os.Getenv("WOSH_PUSH") != "0" && o.ServerCmd == ""
+	if m, err := predict.ParseMode(os.Getenv("WOSH_PREDICT")); err == nil {
+		o.Predict = m
+	}
 	logFile := ""
 	var sshArgs []string
 	for i := 0; i < len(args); i++ {
@@ -258,6 +266,12 @@ func runClient(args []string) int {
 			o.Src = v
 		case "allow-src":
 			o.AllowSrc = true
+		case "predict":
+			m, err := predict.ParseMode(v)
+			if err != nil {
+				fatal("%v", err)
+			}
+			o.Predict = m
 		case "log":
 			logFile = v
 		case "local":
