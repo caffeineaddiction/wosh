@@ -81,8 +81,10 @@ func ParseExit(b []byte) int {
 
 // Control is a JSON control message on the main channel.
 type Control struct {
-	Op    string      `json:"op"`              // info, role (S->C); rfwd, take (C->S)
-	Role  string      `json:"role,omitempty"`  // role: "control" or "view" (peers with a CID)
+	Op    string      `json:"op"`             // info, role, size (S->C); rfwd, take (C->S)
+	Role  string      `json:"role,omitempty"` // role: "control" or "view" (peers with a CID)
+	Cols  uint16      `json:"cols,omitempty"` // size: the session terminal (set by the controller)
+	Rows  uint16      `json:"rows,omitempty"`
 	Token string      `json:"token,omitempty"` // info: session token for chained hops
 	Rfwd  []RemoteFwd `json:"rfwd,omitempty"`  // rfwd: remote forwards to listen on
 }

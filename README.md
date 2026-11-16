@@ -92,6 +92,8 @@ technique and may be flagged by EDR; `vm.memfd_noexec=2` disables it.
   watcher asks for control with a `{"op":"take"}` control frame, and the
   daemon tells each peer its role (`{"op":"role","role":"control"|"view"}`).
   When the controller is gone for 10 s, the longest watcher gets control.
+  The controller sets the terminal size; peers with a cid are told it
+  (`{"op":"size","cols","rows"}`) when they connect and on every change.
   A client without a cid (the `wosh` CLI) always takes control and the peer
   it replaces is dropped, as before.
 * **Roaming**: 1 s pings (6 s timeout), ICE failure, or a local address

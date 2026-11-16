@@ -61,6 +61,8 @@ type Daemon struct {
 	ctrl     *peer          // the peer in control (input, resize, kill, forwards)
 	ctrlGone time.Time      // when the controller went away (viewers get promoted later)
 	joined   uint64         // peer join counter (oldest viewer is promoted first)
+	cols     uint16         // session terminal size, told to every peer with a CID
+	rows     uint16
 	started  bool
 	exited   bool
 	exitCode int
@@ -410,6 +412,7 @@ func (d *Daemon) startShell(m wire.Msg) error {
 		return err
 	}
 	d.ptmx, d.cmd = ptmx, cmd
+	d.cols, d.rows = size.Cols, size.Rows
 	go d.readPTY()
 	return nil
 }
@@ -614,6 +617,34 @@ func (d *Daemon) promoteLocked() {
 	go d.sendRole(best, "control")
 }
 
+func (d *Daemon) size() (uint16, uint16) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.cols, d.rows
+}
+
+// setSize records the terminal size the controller set and tells the other
+// peers, so watchers draw the same grid (scaled to their screens).
+func (d *Daemon) setSize(cols, rows uint16) {
+	d.mu.Lock()
+	if cols == d.cols && rows == d.rows {
+		d.mu.Unlock()
+		return
+	}
+	d.cols, d.rows = cols, rows
+	var ps []*peer
+	for p := range d.peers {
+		if p.open && p.cid != "" {
+			ps = append(ps, p)
+		}
+	}
+	d.mu.Unlock()
+	f := wire.ControlFrame(wire.Control{Op: "size", Cols: cols, Rows: rows})
+	for _, p := range ps {
+		_ = p.dc.Send(f)
+	}
+}
+
 func (d *Daemon) isCtrl(p *peer) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -704,6 +735,9 @@ func (d *Daemon) handleOffer(m wire.Msg) (wire.Msg, error) {
 			_ = dc.Send(wire.ControlFrame(wire.Control{Op: "info", Token: d.token}))
 			if p.cid != "" {
 				_ = dc.Send(wire.ControlFrame(wire.Control{Op: "role", Role: role}))
+				if c, r := d.size(); c > 0 {
+					_ = dc.Send(wire.ControlFrame(wire.Control{Op: "size", Cols: c, Rows: r}))
+				}
 			}
 			if control && (hadCtrl || sameAsCtrl) {
 				// streams we opened (-R, src:, agent) continue on the new link
@@ -805,6 +839,7 @@ func (d *Daemon) onFrame(p *peer, b []byte) {
 			d.mu.Unlock()
 			if ptmx != nil {
 				_ = pty.Setsize(ptmx, &pty.Winsize{Cols: cols, Rows: rows})
+				d.setSize(cols, rows)
 			}
 		}
 	case wire.FRedraw:
