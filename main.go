@@ -70,6 +70,9 @@ client flags (always --long so they never collide with ssh flags):
   -L [bind:]port:host:hostport   forward local port to host:hostport (dialed remotely)
   -R [bind:]port:host:hostport   forward remote port to host:hostport (dialed here)
   -D [bind:]port                 local SOCKS5 proxy through the remote host
+  -A                             forward your ssh-agent (SSH_AUTH_SOCK)
+      Forwards always point at the current destination: after a chained
+      hop they move to the new host; connections survive roaming.
   --env=NAME=VALUE        set a variable in remote sessions (LANG, LC_*,
                           COLORTERM are forwarded automatically)
   --src=NAME              host name meaning "this client" inside sessions
@@ -196,6 +199,10 @@ func runClient(args []string) int {
 		if a == "--" {
 			sshArgs = append(sshArgs, args[i+1:]...)
 			break
+		}
+		if a == "-A" { // agent forwarding over wosh, not the bootstrap ssh
+			o.Agent = true
+			continue
 		}
 		// -L/-R/-D are wosh's (forwarded over WebRTC), not the bootstrap ssh's
 		if len(a) >= 2 && a[0] == '-' && strings.IndexByte("LRD", a[1]) >= 0 {

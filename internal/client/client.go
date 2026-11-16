@@ -41,6 +41,7 @@ type Options struct {
 	Src       string            // host alias for the client in remote sessions ("src")
 	AllowSrc  bool              // don't ask before serving src: requests
 	Forwards  []Forward         // -L / -R / -D
+	Agent     bool              // -A: forward ssh-agent to the current destination
 	Push      bool              // remote side via perl stub: use a compatible installed wosh, else upload one (CLI default)
 	ForcePush bool              // upload even if a compatible wosh is installed
 
@@ -169,6 +170,7 @@ func (c *Client) connectRoot() (*Session, error) {
 	}
 	s := newSession(c, hello.ID, hello.Host, hello.User, nil)
 	s.sock = hello.Sock
+	s.route = [][]string{c.o.SSHArgs}
 	if rkey != "" {
 		if hello.ID != rid {
 			w.close()
@@ -263,6 +265,25 @@ func (c *Client) push(s *Session) {
 	go s.maintain()
 	cols, rows := c.size()
 	s.send(wire.ResizeFrame(cols, rows))
+	c.updateRemoteForwards()
+}
+
+// updateRemoteForwards: -R listeners live on the current destination (top
+// of the stack) only; every other session is told to drop its listeners.
+func (c *Client) updateRemoteForwards() {
+	if len(c.rfwds) == 0 {
+		return
+	}
+	c.mu.Lock()
+	stack := slices.Clone(c.stack)
+	c.mu.Unlock()
+	for i, s := range stack {
+		if i == len(stack)-1 {
+			s.send(wire.ControlFrame(wire.Control{Op: "rfwd", Rfwd: c.rfwds}))
+		} else {
+			s.send(wire.ControlFrame(wire.Control{Op: "rfwd", Rfwd: []wire.RemoteFwd{}}))
+		}
+	}
 }
 
 func (c *Client) top() *Session {
@@ -304,6 +325,7 @@ func (c *Client) remove(s *Session) {
 		cols, rows := c.size()
 		next.send(wire.ResizeFrame(cols, rows))
 		c.updateStatus()
+		c.updateRemoteForwards()
 	}
 }
 
@@ -336,6 +358,11 @@ func (c *Client) onHello(parent *Session, m wire.Msg) {
 		}
 		child := newSession(c, m.ID, m.Host, m.User, parent)
 		child.delegated = trusted
+		child.sock = m.Sock
+		if trusted && m.Hop != nil && parent.route != nil {
+			// reachable without the parent session: ssh through the same hosts
+			child.route = append(slices.Clone(parent.route), m.Hop)
+		}
 		w := newParentWire(parent, m.ID)
 		err := child.negotiate(w)
 		w.close()
@@ -345,6 +372,16 @@ func (c *Client) onHello(parent *Session, m wire.Msg) {
 			return
 		}
 		c.push(child)
+		if child.route != nil {
+			// chained hop: the intermediate host is no longer needed; its
+			// forwards end, and the client now talks to the target only
+			log.Printf("[%s] spinning down %s", parent.id, parent.name())
+			parent.send([]byte{wire.FKill})
+			go func() {
+				time.Sleep(300 * time.Millisecond) // let the kill go out
+				parent.finish(0)
+			}()
+		}
 	}()
 }
 
@@ -501,7 +538,13 @@ func (c *Client) describe() string {
 			state = "reconnecting"
 		}
 		via := "ssh"
-		if s.parent != nil {
+		if s.route != nil && len(s.route) > 1 {
+			var hops []string
+			for _, h := range s.route {
+				hops = append(hops, strings.Join(h, " "))
+			}
+			via = "route " + strings.Join(hops, " -> ")
+		} else if s.parent != nil {
 			via = "via " + s.parent.name()
 		}
 		marker := " "

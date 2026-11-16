@@ -39,6 +39,12 @@ type Session struct {
 	anchor    *pipeWire // bootstrap ssh kept open (macOS LAN permission), closed on finish
 	token     string    // daemon's session token (authenticates chained-hop hellos)
 	delegated bool      // reached via `wosh host` in the parent session (chained hop)
+	// route: ssh args per hop to reach this host without any wosh session
+	// in between (root: the client's ssh args; chained hop: + the args the
+	// intermediate host used). nil: only reachable through parent.
+	route [][]string
+
+	streams *stream.Registry
 
 	srcMu      sync.Mutex
 	srcAllowed int // 0 unasked, 1 allowed, -1 denied (src: access from this host)
@@ -76,6 +82,7 @@ func newSession(c *Client, id, host, user string, parent *Session) *Session {
 		waiters: map[string]chan wire.Msg{},
 		deadCh:  make(chan struct{}, 1),
 		done:    make(chan struct{}),
+		streams: stream.NewRegistry(),
 	}
 }
 
@@ -140,7 +147,10 @@ func (s *Session) negotiate(w sigChan) error {
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
 		// streams the remote host opens to us: -R forwards, src: transfers
 		if spec, ok := stream.ParseLabel(dc.Label()); ok {
-			go s.c.fromRemote(s, stream.Wrap(dc), spec)
+			if r, isNew := stream.Accept(dc, spec, s.streams.Get); isNew {
+				s.streams.Add(r)
+				go s.c.fromRemote(s, r, spec)
+			}
 		}
 	})
 	dc, err := pc.CreateDataChannel("wosh", nil)
@@ -186,7 +196,7 @@ func (s *Session) negotiate(w sigChan) error {
 		T: wire.TOffer, ID: s.id, Key: s.key, SDP: pc.LocalDescription().SDP,
 		ICE: s.c.o.ICE, Relay: s.c.o.RelayOnly, Term: s.c.o.Term,
 		Cols: cols, Rows: rows, RxOut: rx,
-		Env: s.c.remoteEnv(), Src: s.c.o.Src, User: localUser(),
+		Env: s.c.remoteEnv(), Src: s.c.o.Src, User: localUser(), Agent: s.c.o.Agent,
 	})
 	if err != nil {
 		return err
@@ -237,7 +247,11 @@ func (s *Session) negotiate(w sigChan) error {
 		pending = pending[n:]
 	}
 	_ = dc.Send(wire.ResizeFrame(cols, rows))
-	if s.parent == nil && len(s.c.rfwds) > 0 {
+	if gen > 1 {
+		// forwards / transfers we opened continue on the new link
+		s.streams.ReopenAll(pc)
+	}
+	if len(s.c.rfwds) > 0 && s.c.isTop(s) {
 		_ = dc.Send(wire.ControlFrame(wire.Control{Op: "rfwd", Rfwd: s.c.rfwds}))
 	}
 	log.Printf("[%s] connected gen %d", s.id, gen)
@@ -403,7 +417,16 @@ func (s *Session) finish(code int) {
 		s.mu.Unlock()
 		close(s.done)
 		log.Printf("[%s] exited %d", s.id, code)
-		if s.delegated && s.parent != nil {
+		s.streams.KillAll()
+		parentGone := s.parent == nil
+		if s.parent != nil {
+			select {
+			case <-s.parent.done:
+				parentGone = true
+			default:
+			}
+		}
+		if s.delegated && !parentGone && s.route == nil {
 			// release the `wosh host` process parked in the parent's terminal
 			s.parent.sendInput(wire.EncodeInput(wire.Msg{T: wire.TBye, ID: s.id}))
 		}
@@ -483,6 +506,9 @@ func (s *Session) maintain() {
 }
 
 func (s *Session) reconnect() error {
+	if s.route != nil && len(s.route) > 1 {
+		return s.reconnectRoute()
+	}
 	if s.parent != nil {
 		// signal through the parent's terminal, where `wosh up` is parked
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -525,7 +551,7 @@ func (s *Session) reconnect() error {
 }
 
 // openStream opens a stream to this session's host (waits for a connection).
-func (s *Session) openStream(spec wire.StreamSpec) (*stream.Chan, error) {
+func (s *Session) openStream(spec wire.StreamSpec) (*stream.Resumable, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := s.waitAlive(ctx); err != nil {
@@ -534,5 +560,38 @@ func (s *Session) openStream(spec wire.StreamSpec) (*stream.Chan, error) {
 	s.mu.Lock()
 	pc := s.pc
 	s.mu.Unlock()
-	return stream.Open(pc, spec)
+	r, err := stream.OpenResumable(pc, spec)
+	if err == nil {
+		s.streams.Add(r)
+	}
+	return r, err
+}
+
+// reconnectRoute reattaches by ssh'ing through the same hosts as the
+// original chained hops (each with that host's own ssh config and keys);
+// the intermediate wosh sessions are gone.
+func (s *Session) reconnectRoute() error {
+	final := perlCommand(pushAttachStub, s.sock, s.id)
+	if s.sock == "" {
+		final = RemoteCommand("wosh", "attach", s.id)
+	}
+	w, err := s.c.startPipe(pipeCmd{remote: hopCommand(s.route[1:], final)})
+	if err != nil {
+		return err
+	}
+	defer w.close()
+	ctx, cancel := context.WithTimeout(context.Background(), sigTimeout)
+	hello, err := w.recv(ctx, s.id)
+	cancel()
+	if err != nil {
+		return err
+	}
+	if hello.T == wire.TError {
+		if hello.Err == noSession {
+			s.c.notice("session on %s is gone", s.name())
+			go s.finish(255)
+		}
+		return fmt.Errorf("remote: %s", hello.Err)
+	}
+	return s.negotiate(w)
 }

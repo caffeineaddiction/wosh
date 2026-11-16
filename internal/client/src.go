@@ -74,7 +74,7 @@ func srcCommand(spec wire.StreamSpec) ([]string, string, error) {
 	return nil, "", fmt.Errorf("only rsync/scp/sftp transfers run via src:")
 }
 
-func (c *Client) serveSrcExec(s *Session, ch *stream.Chan, spec wire.StreamSpec) {
+func (c *Client) serveSrcExec(s *Session, ch stream.Conn, spec wire.StreamSpec) {
 	argv, what, err := srcCommand(spec)
 	if err == nil && !c.allowSrc(s, what+" file transfer") {
 		err = fmt.Errorf("src: access denied by the wosh client")

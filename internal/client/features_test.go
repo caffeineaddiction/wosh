@@ -41,6 +41,38 @@ func echoServer(t *testing.T, prefix string) int {
 	return l.Addr().(*net.TCPAddr).Port
 }
 
+// echoAll echoes everything until EOF (long-lived connections).
+func echoAll(t *testing.T) int {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go func() { defer c.Close(); _, _ = io.Copy(c, c) }()
+		}
+	}()
+	return l.Addr().(*net.TCPAddr).Port
+}
+
+func echoLine(t *testing.T, c net.Conn, msg string) {
+	t.Helper()
+	_ = c.SetDeadline(time.Now().Add(20 * time.Second))
+	if _, err := c.Write([]byte(msg)); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, len(msg))
+	if _, err := io.ReadFull(c, buf); err != nil || string(buf) != msg {
+		t.Fatalf("echo %q: got %q %v", msg, buf, err)
+	}
+}
+
 func freePort(t *testing.T) int {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -83,19 +115,36 @@ func TestFeatures(t *testing.T) {
 	t.Setenv("PATH", "/usr/bin:/bin")
 
 	remoteEcho := echoServer(t, "remote:")
+	longEcho := echoAll(t)
+	// the chained hop reconnects by ssh'ing through the intermediate host;
+	// stand in for ssh: run the remote command locally
+	fake := filepath.Join(tmp, "fakessh")
+	_ = os.WriteFile(fake, []byte("#!/bin/sh\nfor a; do last=$a; done\nexec sh -c \"$last\"\n"), 0o755)
+	t.Setenv("WOSH_HOP_SSH", fake)
 	clientEcho := echoServer(t, "client:")
-	lPort, rPort, dPort := freePort(t), freePort(t), freePort(t)
+	lPort, rPort, dPort, l2Port := freePort(t), freePort(t), freePort(t), freePort(t)
 	fl, _ := ParseForward('L', fmt.Sprintf("127.0.0.1:%d:127.0.0.1:%d", lPort, remoteEcho))
+	fl2, _ := ParseForward('L', fmt.Sprintf("127.0.0.1:%d:127.0.0.1:%d", l2Port, longEcho))
 	fr, _ := ParseForward('R', fmt.Sprintf("127.0.0.1:%d:127.0.0.1:%d", rPort, clientEcho))
 	fd, _ := ParseForward('D', fmt.Sprintf("127.0.0.1:%d", dPort))
+
+	// throwaway ssh-agent for -A
+	agentSock := filepath.Join(tmp, "agent.sock")
+	agent := exec.Command("ssh-agent", "-D", "-a", agentSock)
+	if err := agent.Start(); err == nil {
+		t.Cleanup(func() { _ = agent.Process.Kill() })
+		waitCond(t, "ssh-agent", 5*time.Second, func() bool { _, err := os.Stat(agentSock); return err == nil })
+		t.Setenv("SSH_AUTH_SOCK", agentSock)
+	}
 
 	inR, inW := io.Pipe()
 	out := &syncBuf{}
 	c, err := Start(Options{
+		Agent: true,
 		Local: bin, In: inR, Out: out, Err: out, Auto: true, AllowSrc: true,
 		ICE: []wire.ICEServer{}, Term: "dumb",
 		Env:      map[string]string{"WOSH_TEST_VAR": "hello-env"},
-		Forwards: []Forward{fl, fr, fd},
+		Forwards: []Forward{fl, fr, fd, fl2},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -137,6 +186,15 @@ func TestFeatures(t *testing.T) {
 		}
 	})
 
+	t.Run("-A agent", func(t *testing.T) {
+		if os.Getenv("SSH_AUTH_SOCK") != agentSock {
+			t.Skip("no ssh-agent")
+		}
+		// exit 1 = connected to an agent with no keys (2 = no agent)
+		typ(`ssh-add -l >/dev/null 2>&1; echo "AGENT-$?-${SSH_AUTH_SOCK##*/}"`)
+		waitFor(t, out, "AGENT-1-agent.sock", 20*time.Second)
+	})
+
 	t.Run("-L", func(t *testing.T) {
 		conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", lPort))
 		if err != nil {
@@ -170,6 +228,20 @@ func TestFeatures(t *testing.T) {
 		if got, err := roundTrip(conn, "ping-D"); got != "remote:ping-D" {
 			t.Fatalf("got %q %v", got, err)
 		}
+	})
+
+	t.Run("forwarded connection survives reconnect", func(t *testing.T) {
+		conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", l2Port))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		echoLine(t, conn, "before-roam")
+		root.markDead(0, "test roam")
+		big := strings.Repeat("x", 200*1024) // sent while the link is down
+		echoLine(t, conn, big)
+		waitCond(t, "root reconnect", 30*time.Second, root.isAlive)
+		echoLine(t, conn, "after-roam")
 	})
 
 	t.Run("src: rsync scp sftp", func(t *testing.T) {
@@ -217,17 +289,39 @@ func TestFeatures(t *testing.T) {
 			t.Fatalf("no chained child; output tail:\n%s", o[max(0, len(o)-1500):])
 		}
 		child := c.top()
-		if !child.delegated || child.parent != root {
-			t.Fatal("child not a delegated hop of root")
+		if !child.delegated || len(child.route) != 2 {
+			t.Fatalf("child not a routed hop: %+v", child.route)
 		}
 		typ(`echo "hop-$WOSH_SESSION"`)
 		waitFor(t, out, "hop-"+child.id, 20*time.Second)
-		child.markDead(0, "test") // reconnect through the parked delegate
-		waitCond(t, "child reconnect", 30*time.Second, child.isAlive)
-		typ("exit")
-		waitCond(t, "back to root", 20*time.Second, func() bool { return c.top() == root })
-		typ(`echo "back-$WOSH_SESSION"`)
-		waitFor(t, out, "back-"+root.id, 20*time.Second)
+
+		// the intermediate session spins down
+		select {
+		case <-root.done:
+		case <-time.After(15 * time.Second):
+			t.Fatal("intermediate session still running")
+		}
+		// forwards now go to the new destination
+		conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", l2Port))
+		if err != nil {
+			t.Fatal(err)
+		}
+		echoLine(t, conn, "via-hop")
+		_ = conn.Close()
+		var rc net.Conn
+		waitCond(t, "-R on new destination", 15*time.Second, func() bool {
+			rc, err = net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", rPort))
+			return err == nil
+		})
+		if got, err := roundTrip(rc, "ping-R2"); got != "client:ping-R2" {
+			t.Fatalf("-R after hop: %q %v", got, err)
+		}
+
+		// reconnect without the intermediate session: ssh through the route
+		child.markDead(0, "test")
+		waitCond(t, "routed reconnect", 30*time.Second, child.isAlive)
+		typ(`echo "still-$WOSH_SESSION"`)
+		waitFor(t, out, "still-"+child.id, 20*time.Second)
 	})
 
 	typ("exit")

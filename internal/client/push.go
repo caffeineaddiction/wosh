@@ -2,6 +2,7 @@ package client
 
 import (
 	"bytes"
+	"encoding/base64"
 	"errors"
 	"strconv"
 
@@ -71,6 +72,24 @@ const pushAttachStub = `use IO::Socket::UNIX;use MIME::Base64;$|=1;($k,$i)=@ARGV
 	`osc(qq({"t":"hello","id":"$i","v":1}));$/="\r";` +
 	`while(<STDIN>){if(/WOSH:([A-Za-z0-9+\/=]+)/){print $s decode_base64($1)."\n";` +
 	`{local $/="\n";$r=<$s>}defined $r or exit 1;chomp $r;osc($r);exit 0 if $r=~/"t":"answer"/}}`
+
+// hopStub runs ssh on an intermediate host with that host's own config and
+// keys: argv (NUL-separated, base64) is passed to ssh unchanged, so nested
+// remote commands need no quoting through the intermediate login shell.
+// WOSH_HOP_SSH overrides the ssh program (tests).
+const hopStub = `use MIME::Base64;exec {$ENV{WOSH_HOP_SSH}||"ssh"} "ssh",split(chr(0),decode_base64($ARGV[0]));` +
+	`die "wosh: cannot run ssh: $^E\n"`
+
+// hopCommand builds a remote command that ssh's through hops (each the
+// ssh args used on the previous host) and finally runs final.
+func hopCommand(hops [][]string, final string) string {
+	if len(hops) == 0 {
+		return final
+	}
+	argv := append([]string{"-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"}, hops[0]...)
+	argv = append(argv, hopCommand(hops[1:], final))
+	return perlCommand(hopStub, base64.StdEncoding.EncodeToString([]byte(strings.Join(argv, "\x00"))))
+}
 
 func perlCommand(stub string, args ...string) string {
 	parts := []string{"perl", "-e", "'" + stub + "'"}
@@ -258,7 +277,7 @@ func fetchBuild(key string) (*localBuild, error) {
 }
 
 // serveBuild sends a gzipped build to a chained hop that needs one.
-func serveBuild(ch *stream.Chan, key string) {
+func serveBuild(ch stream.Conn, key string) {
 	goos, arch, _ := strings.Cut(key, "-")
 	b, err := binaryFor(goos, arch)
 	var z []byte

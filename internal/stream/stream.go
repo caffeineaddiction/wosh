@@ -11,6 +11,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pion/webrtc/v4"
@@ -68,6 +69,17 @@ type Chan struct {
 	cond   *sync.Cond
 	queue  [][]byte
 	closed bool
+	dead   atomic.Bool // replaced by a newer channel: stop sending
+}
+
+// kill abandons the channel (a resumed stream moved to a new one).
+func (c *Chan) kill() {
+	c.dead.Store(true)
+	_ = c.dc.Close()
+	c.mu.Lock()
+	c.closed = true
+	c.mu.Unlock()
+	c.cond.Broadcast()
 }
 
 // Wrap attaches to a data channel (call before it opens, e.g. in
@@ -145,13 +157,16 @@ func (c *Chan) Send(typ byte, p []byte) error {
 	for {
 		n := min(len(p), chunk)
 		for c.dc.BufferedAmount() > maxBuffered {
-			select {
-			case <-c.low:
-			case <-time.After(time.Second):
-			}
-			if c.dc.ReadyState() != webrtc.DataChannelStateOpen {
+			if c.dead.Load() || c.dc.ReadyState() != webrtc.DataChannelStateOpen {
 				return io.ErrClosedPipe
 			}
+			select {
+			case <-c.low:
+			case <-time.After(200 * time.Millisecond):
+			}
+		}
+		if c.dead.Load() {
+			return io.ErrClosedPipe
 		}
 		msg := make([]byte, 1+n)
 		msg[0] = typ

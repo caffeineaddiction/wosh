@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 
@@ -100,8 +101,9 @@ func (c *Client) prepareForwards() error {
 	return nil
 }
 
-// startForwards opens the local listeners of -L / -D through the root session.
-func (c *Client) startForwards(root *Session) {
+// startForwards opens the local listeners of -L / -D (connections go to the
+// current destination).
+func (c *Client) startForwards(_ *Session) {
 	for _, f := range c.o.Forwards {
 		if f.Kind == 'R' {
 			continue
@@ -117,13 +119,18 @@ func (c *Client) startForwards(root *Session) {
 				if err != nil {
 					return
 				}
-				go c.forwardConn(root, f, conn)
+				go c.forwardConn(f, conn)
 			}
 		}(f)
 	}
 }
 
-func (c *Client) forwardConn(root *Session, f Forward, conn net.Conn) {
+func (c *Client) forwardConn(f Forward, conn net.Conn) {
+	dst := c.top() // forwards go to the current destination
+	if dst == nil {
+		_ = conn.Close()
+		return
+	}
 	host, port := f.Host, f.HostPort
 	if f.Kind == 'D' {
 		var err error
@@ -132,7 +139,7 @@ func (c *Client) forwardConn(root *Session, f Forward, conn net.Conn) {
 			return
 		}
 	}
-	ch, err := root.openStream(wire.StreamSpec{K: "tcp", Host: host, Port: port})
+	ch, err := dst.openStream(wire.StreamSpec{K: "tcp", Host: host, Port: port})
 	if err != nil {
 		if f.Kind == 'D' {
 			_, _ = conn.Write([]byte{5, 1, 0, 1, 0, 0, 0, 0, 0, 0})
@@ -200,17 +207,13 @@ func socks5Handshake(c net.Conn) (string, int, error) {
 }
 
 // fromRemote serves streams a remote host opened to us.
-func (c *Client) fromRemote(s *Session, ch *stream.Chan, spec wire.StreamSpec) {
+func (c *Client) fromRemote(s *Session, ch stream.Conn, spec wire.StreamSpec) {
 	refuse := func(msg string) {
 		_ = ch.Send(stream.Err, []byte(msg))
 		_ = ch.Close()
 	}
 	switch spec.K {
 	case "rfwd":
-		if s.parent != nil {
-			refuse("forwards belong to the root session")
-			return
-		}
 		for _, f := range c.o.Forwards {
 			if f.Kind == 'R' && f.id == spec.ID {
 				conn, err := net.Dial("tcp", net.JoinHostPort(f.Host, strconv.Itoa(f.HostPort)))
@@ -225,6 +228,18 @@ func (c *Client) fromRemote(s *Session, ch *stream.Chan, spec wire.StreamSpec) {
 		refuse("unknown forward")
 	case "exec":
 		c.serveSrcExec(s, ch, spec)
+	case "agent":
+		sock := os.Getenv("SSH_AUTH_SOCK")
+		if !c.o.Agent || sock == "" {
+			refuse("agent forwarding not enabled")
+			return
+		}
+		conn, err := net.Dial("unix", sock)
+		if err != nil {
+			refuse(err.Error())
+			return
+		}
+		stream.Splice(ch, conn)
 	case "build":
 		serveBuild(ch, spec.Cmd)
 	case "src-ssh":

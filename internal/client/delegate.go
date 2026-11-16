@@ -42,6 +42,7 @@ func Delegate(o Options) (int, error) {
 	}
 	hello.Token = os.Getenv("WOSH_TOKEN")
 	hello.Via, _ = os.Hostname()
+	hello.Hop = o.SSHArgs // so the client can reach the target without us
 	if _, err := o.Out.Write(wire.EncodeOSC(hello)); err != nil {
 		return 255, err
 	}

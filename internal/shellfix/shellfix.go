@@ -1,7 +1,8 @@
 // Package shellfix implements `wosh --fix-shell`: make the session's bin dir
-// ($WOSH_BIN_DIR: wosh, ssh, scp, sftp shims) win in PATH even when a shell
-// rc rebuilds PATH, by appending a small managed block to the end of the
-// shell's config file(s).
+// ($WOSH_BIN_DIR: wosh, ssh, scp, sftp shims) win in PATH and the forwarded
+// ssh-agent ($WOSH_AGENT_SOCK) win over SSH_AUTH_SOCK, even when a shell rc
+// sets them, by appending a small managed block to the end of the shell's
+// config file(s).
 package shellfix
 
 import (
@@ -19,13 +20,22 @@ const (
 var snippets = map[string]string{
 	"fish": `if set -q WOSH_BIN_DIR
     set -gx PATH $WOSH_BIN_DIR (string match -v -- $WOSH_BIN_DIR $PATH)
+end
+if set -q WOSH_AGENT_SOCK
+    set -gx SSH_AUTH_SOCK $WOSH_AGENT_SOCK
 end`,
 	"posix": `if [ -n "${WOSH_BIN_DIR:-}" ]; then
     PATH="$WOSH_BIN_DIR:$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF -- "$WOSH_BIN_DIR" | paste -s -d: -)"
     export PATH
+fi
+if [ -n "${WOSH_AGENT_SOCK:-}" ]; then
+    SSH_AUTH_SOCK=$WOSH_AGENT_SOCK; export SSH_AUTH_SOCK
 fi`,
 	"csh": `if ( $?WOSH_BIN_DIR ) then
     setenv PATH "${WOSH_BIN_DIR}:${PATH}"
+endif
+if ( $?WOSH_AGENT_SOCK ) then
+    setenv SSH_AUTH_SOCK "${WOSH_AGENT_SOCK}"
 endif`,
 }
 

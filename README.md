@@ -96,19 +96,27 @@ technique and may be flagged by EDR; `vm.memfd_noexec=2` disables it.
   (C may be reachable only from B), then hands C to your client, which
   connects to C directly (authenticated by B's session token, no prompt;
   the build for C's platform is fetched from your client if B lacks it).
-  B idles in the background as C's reconnect path; exiting C returns to B.
+  B then spins down: its session, forwards and connections end. C is
+  reconnected by ssh'ing through the same hosts (`ssh B` -> B's own
+  `ssh C` with B's config/keys -> reattach; needs only perl+ssh on B).
 * **`src:` = your client**: `rsync -a src:dir/ .`, `scp f src:`,
   `sftp src`. Transfers (rsync --server, scp -t/-f, sftp subsystem) run on
   the client over the wosh channel after a once-per-session prompt
   (`--allow-src` skips it), in your home directory. Anything else (e.g.
   `ssh src`) falls back to real ssh into the client's sshd, tunnelled via
   wosh. `--src=NAME` renames the alias.
-* **Port forwarding**: `-L`, `-R`, `-D` with ssh syntax, over extra data
-  channels (forwarded TCP connections do not survive a reconnect yet).
+* **Port forwarding / agent**: `-L`, `-R`, `-D`, `-A` with ssh syntax.
+  They always point at the current destination: after a chained hop the
+  -L/-D listeners send new connections to the new host, -R listeners move
+  there, and the agent socket is offered there. Forwarded connections
+  (VNC, SOCKS, agent, src: transfers) survive roaming between the same
+  two endpoints: streams are sequenced, acknowledged and resumed on the
+  new link.
 
-If your shell rc rebuilds `PATH` (common with fish), the session bin dir
-may end up behind `/usr/bin`; rsync still works (`RSYNC_RSH` is set) but
-`scp`/`sftp` to `src:` need the shims first. Add at the end of your rc:
+If your shell rc rebuilds `PATH` or sets `SSH_AUTH_SOCK` (common with fish),
+the session bin dir may end up behind `/usr/bin` and the forwarded agent
+hidden. `wosh --fix-shell` adds a managed block to the end of your rc that
+restores both; by hand:
 
 ```sh
 # fish
@@ -152,8 +160,8 @@ the selected candidate pair.
 * Reconnecting the root needs non-interactive ssh auth (keys/agent).
 * Hops reached with plain ssh still need `wosh up` and an installed wosh;
   use `wosh host` from inside a session instead (chained hop).
-* Forwarded TCP connections break on reconnect (the session does not).
-* Forwards (-L/-R/-D) apply to the root session only.
+* A chained hop ends the intermediate host's forwarded connections (by
+  design); new connections go to the new destination.
 * tmux/screen on an intermediate hop swallow unknown OSC (use passthrough).
 * No predictive local echo (mosh's SSP); no IPv6-only/TURN-TCP tuning yet.
 * Sessions detached with `~&` can only be resumed at the root (`--resume`).

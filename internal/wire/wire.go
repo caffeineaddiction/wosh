@@ -79,6 +79,8 @@ type Msg struct {
 	Src    string            `json:"src,omitempty"`    // offer: host name that means "the client" (src:path)
 	Token  string            `json:"token,omitempty"`  // hello: parent session token (chained hop, no prompt)
 	Via    string            `json:"via,omitempty"`    // hello: host that relayed a chained hop
+	Hop    []string          `json:"hop,omitempty"`    // hello: ssh args the relaying host used to reach this one
+	Agent  bool              `json:"agent,omitempty"`  // offer: forward the client's ssh-agent
 	Stream *StreamSpec       `json:"stream,omitempty"` // control socket: open a stream to the client
 	Text   string            `json:"text,omitempty"`   // control socket: input for TType
 }
@@ -91,6 +93,11 @@ type StreamSpec struct {
 	ID   int    `json:"id,omitempty"`   // rfwd: forward id
 	Cmd  string `json:"cmd,omitempty"`  // exec: command line / subsystem name
 	Sub  bool   `json:"sub,omitempty"`  // exec: Cmd is an ssh subsystem (sftp)
+	// SID identifies a resumable stream; RX (on a reopen) is the next
+	// message sequence number the opener expects.
+	SID    string `json:"sid,omitempty"`
+	RX     uint64 `json:"rx,omitempty"`
+	Resume bool   `json:"resume,omitempty"`
 }
 
 func encode(m Msg) string {

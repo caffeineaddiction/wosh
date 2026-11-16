@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"net"
 	"os"
 	"os/exec"
@@ -74,6 +75,7 @@ type Daemon struct {
 	baseDir    string // <runtime>/<id>.d
 	binDir     string // session bin dir (wosh + shims), first in PATH
 	rfwd       map[int]net.Listener
+	streams    *stream.Registry
 
 	kick chan struct{}
 	quit chan struct{}
@@ -108,14 +110,15 @@ func RunDaemon(opts DaemonOptions) error {
 	defer os.Remove(sock)
 
 	d := &Daemon{
-		opts:  opts,
-		out:   newRing(ringSize),
-		kick:  make(chan struct{}, 1),
-		quit:  make(chan struct{}),
-		ln:    ln,
-		conns: map[net.Conn]chan struct{}{},
-		token: newToken(),
-		rfwd:  map[int]net.Listener{},
+		opts:    opts,
+		out:     newRing(ringSize),
+		kick:    make(chan struct{}, 1),
+		quit:    make(chan struct{}),
+		ln:      ln,
+		conns:   map[net.Conn]chan struct{}{},
+		token:   newToken(),
+		rfwd:    map[int]net.Listener{},
+		streams: stream.NewRegistry(),
 	}
 	if err := d.setupBinDir(); err != nil {
 		log.Printf("session bin dir: %v", err)
@@ -150,6 +153,7 @@ func RunDaemon(opts DaemonOptions) error {
 	for _, l := range d.rfwd {
 		_ = l.Close()
 	}
+	d.streams.KillAll()
 	if d.baseDir != "" {
 		_ = os.RemoveAll(d.baseDir)
 	}
@@ -364,7 +368,20 @@ func (d *Daemon) startShell(m wire.Msg) error {
 	if term == "" {
 		term = "xterm-256color"
 	}
-	cmd.Env = d.sessionEnv(term, m.Env)
+	env := m.Env
+	if m.Agent && d.baseDir != "" {
+		if sock, err := d.listenAgent(); err == nil {
+			env = maps.Clone(env)
+			if env == nil {
+				env = map[string]string{}
+			}
+			env["SSH_AUTH_SOCK"] = sock
+			env["WOSH_AGENT_SOCK"] = sock // survives rc files that set SSH_AUTH_SOCK (--fix-shell)
+		} else {
+			log.Printf("agent forwarding: %v", err)
+		}
+	}
+	cmd.Env = d.sessionEnv(term, env)
 	size := &pty.Winsize{Cols: m.Cols, Rows: m.Rows}
 	if size.Cols == 0 || size.Rows == 0 {
 		size = &pty.Winsize{Cols: 80, Rows: 24}
@@ -517,7 +534,10 @@ func (d *Daemon) handleOffer(m wire.Msg) (wire.Msg, error) {
 
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
 		if spec, ok := stream.ParseLabel(dc.Label()); ok {
-			go d.fromClient(stream.Wrap(dc), spec)
+			if r, isNew := stream.Accept(dc, spec, d.streams.Get); isNew {
+				d.streams.Add(r)
+				go d.fromClient(r, spec)
+			}
 			return
 		}
 		if dc.Label() != "wosh" {
@@ -544,6 +564,10 @@ func (d *Daemon) handleOffer(m wire.Msg) (wire.Msg, error) {
 			log.Printf("peer connected")
 			_ = dc.Send(wire.U64Frame(wire.FAck, d.inputRx()))
 			_ = dc.Send(wire.ControlFrame(wire.Control{Op: "info", Token: d.token}))
+			if old != nil && old != p {
+				// streams we opened (-R, src:, agent) continue on the new link
+				d.streams.ReopenAll(pc)
+			}
 			d.poke()
 		})
 		dc.OnMessage(func(msg webrtc.DataChannelMessage) { d.onFrame(p, msg.Data) })
@@ -669,14 +693,18 @@ func (d *Daemon) onFrame(p *peer, b []byte) {
 // --- streams --------------------------------------------------------------------
 
 // openToClient opens a stream from this host to the client.
-func (d *Daemon) openToClient(spec wire.StreamSpec) (*stream.Chan, error) {
+func (d *Daemon) openToClient(spec wire.StreamSpec) (*stream.Resumable, error) {
 	deadline := time.Now().Add(20 * time.Second)
 	for {
 		d.mu.Lock()
 		p := d.cur
 		d.mu.Unlock()
 		if p != nil && p.open {
-			return stream.Open(p.pc, spec)
+			r, err := stream.OpenResumable(p.pc, spec)
+			if err == nil {
+				d.streams.Add(r)
+			}
+			return r, err
 		}
 		if time.Now().After(deadline) {
 			return nil, errors.New("wosh client not connected")
@@ -687,7 +715,7 @@ func (d *Daemon) openToClient(spec wire.StreamSpec) (*stream.Chan, error) {
 
 // fromClient serves a stream the client opened: -L / -D forwards, which this
 // host dials (like ssh's direct-tcpip).
-func (d *Daemon) fromClient(ch *stream.Chan, spec wire.StreamSpec) {
+func (d *Daemon) fromClient(ch stream.Conn, spec wire.StreamSpec) {
 	if spec.K != "tcp" || spec.Port <= 0 || spec.Port > 65535 {
 		_ = ch.Send(stream.Err, []byte("unsupported stream"))
 		_ = ch.Close()
@@ -705,6 +733,20 @@ func (d *Daemon) fromClient(ch *stream.Chan, spec wire.StreamSpec) {
 // listenRemote starts -R listeners (idempotent: the client resends its list
 // after every reconnect).
 func (d *Daemon) listenRemote(fwds []wire.RemoteFwd) {
+	// the list is the desired set: drop listeners not in it (the client
+	// moved its destination elsewhere)
+	want := map[int]bool{}
+	for _, f := range fwds {
+		want[f.ID] = true
+	}
+	d.mu.Lock()
+	for id, l := range d.rfwd {
+		if !want[id] {
+			_ = l.Close()
+			delete(d.rfwd, id)
+		}
+	}
+	d.mu.Unlock()
 	for _, f := range fwds {
 		d.mu.Lock()
 		_, exists := d.rfwd[f.ID]
@@ -716,7 +758,14 @@ func (d *Daemon) listenRemote(fwds []wire.RemoteFwd) {
 		if bind == "" {
 			bind = "localhost"
 		}
-		l, err := net.Listen("tcp", net.JoinHostPort(bind, fmt.Sprint(f.Port)))
+		var l net.Listener
+		var err error
+		for try := 0; try < 25; try++ { // the previous destination may still hold the port
+			if l, err = net.Listen("tcp", net.JoinHostPort(bind, fmt.Sprint(f.Port))); err == nil {
+				break
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
 		if err != nil {
 			log.Printf("-R %s:%d: %v", bind, f.Port, err)
 			continue
@@ -742,4 +791,36 @@ func (d *Daemon) listenRemote(fwds []wire.RemoteFwd) {
 			}
 		}(f.ID)
 	}
+}
+
+// listenAgent exposes the client's ssh-agent in this session (-A).
+func (d *Daemon) listenAgent() (string, error) {
+	sock := filepath.Join(d.baseDir, "agent.sock")
+	_ = os.Remove(sock)
+	l, err := net.Listen("unix", sock)
+	if err != nil {
+		return "", err
+	}
+	_ = os.Chmod(sock, 0o600)
+	go func() {
+		<-d.quit
+		_ = l.Close()
+	}()
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				ch, err := d.openToClient(wire.StreamSpec{K: "agent"})
+				if err != nil {
+					_ = c.Close()
+					return
+				}
+				stream.Splice(ch, c)
+			}()
+		}
+	}()
+	return sock, nil
 }

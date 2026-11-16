@@ -46,14 +46,14 @@ func TestSnippetsWork(t *testing.T) {
 		if err != nil {
 			continue
 		}
-		script := "set -gx PATH /usr/bin /bin /wosh/bin\n" + snippets[kind] + "\nstring join : $PATH"
+		script := "set -gx PATH /usr/bin /bin /wosh/bin\nset -gx SSH_AUTH_SOCK /rc/agent\n" + snippets[kind] + "\necho (string join : $PATH) $SSH_AUTH_SOCK"
 		if kind == "posix" {
-			script = "PATH=/usr/bin:/bin:/wosh/bin\n" + snippets[kind] + "\necho \"$PATH\""
+			script = "PATH=/usr/bin:/bin:/wosh/bin\nSSH_AUTH_SOCK=/rc/agent\n" + snippets[kind] + "\necho \"$PATH\" \"$SSH_AUTH_SOCK\""
 		}
 		cmd := exec.Command(p, "-c", script)
-		cmd.Env = append(os.Environ(), "WOSH_BIN_DIR=/wosh/bin")
+		cmd.Env = append(os.Environ(), "WOSH_BIN_DIR=/wosh/bin", "WOSH_AGENT_SOCK=/wosh/agent")
 		out, err := cmd.CombinedOutput()
-		if got := strings.TrimSpace(string(out)); err != nil || got != "/wosh/bin:/usr/bin:/bin" {
+		if got := strings.TrimSpace(string(out)); err != nil || got != "/wosh/bin:/usr/bin:/bin /wosh/agent" {
 			t.Errorf("%s: %q %v", sh, got, err)
 		}
 	}
