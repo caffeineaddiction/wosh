@@ -25,6 +25,36 @@ type sigChan interface {
 
 // --- ssh / local process pipe ------------------------------------------------
 
+// children are the bootstrap/signaling processes (ssh) this client started
+// and has not reaped. KillChildren ends them on every way out: an ssh left
+// behind loses its terminal and is stopped (SIGTTIN/SIGTTOU) forever.
+var children = struct {
+	sync.Mutex
+	m map[*exec.Cmd]bool
+}{m: map[*exec.Cmd]bool{}}
+
+func trackChild(cmd *exec.Cmd, live bool) {
+	children.Lock()
+	defer children.Unlock()
+	if live {
+		children.m[cmd] = true
+	} else {
+		delete(children.m, cmd)
+	}
+}
+
+// KillChildren kills every process startPipe started that is still running.
+func KillChildren() {
+	children.Lock()
+	defer children.Unlock()
+	for cmd := range children.m {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		delete(children.m, cmd)
+	}
+}
+
 type pipeWire struct {
 	cmd      *exec.Cmd
 	stdin    io.WriteCloser
@@ -93,6 +123,7 @@ func (c *Client) startPipe(pc pipeCmd) (*pipeWire, error) {
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
+	trackChild(cmd, true)
 	w := &pipeWire{cmd: cmd, stdin: stdin, msgs: make(chan wire.Msg, 8)}
 	show := func(out []byte) {
 		if pc.interactive {
@@ -181,6 +212,7 @@ func (w *pipeWire) close() {
 		case <-time.After(5 * time.Second):
 			_ = w.cmd.Process.Kill()
 		}
+		trackChild(w.cmd, false)
 	})
 }
 

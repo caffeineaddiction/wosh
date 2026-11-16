@@ -9,8 +9,10 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"golang.org/x/term"
@@ -148,6 +150,7 @@ func main() {
 
 func fatal(format string, a ...any) {
 	fmt.Fprintf(os.Stderr, "wosh: "+format+"\n", a...)
+	client.KillChildren()
 	os.Exit(1)
 }
 
@@ -193,6 +196,15 @@ func daemon(args []string) {
 }
 
 func runClient(args []string) int {
+	// never leave a bootstrap ssh behind: not on return, not when killed
+	defer client.KillChildren()
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGHUP, syscall.SIGTERM, syscall.SIGQUIT)
+	go func() {
+		s := <-sigs
+		client.KillChildren()
+		os.Exit(128 + int(s.(syscall.Signal)))
+	}()
 	o := client.Options{ServerCmd: os.Getenv("WOSH_SERVER_CMD")}
 	stun, turn := os.Getenv("WOSH_STUN"), os.Getenv("WOSH_TURN")
 	// push by default; an explicit --server-cmd means "use the installed one"
