@@ -93,6 +93,10 @@ type Msg struct {
 	// control, and the peer it replaces is dropped (the original behaviour).
 	CID  string `json:"cid,omitempty"`  // offer: client instance id
 	Join bool   `json:"join,omitempty"` // offer: watch if another client has control
+	// Watch (with CID) makes a passive peer, e.g. a recorder: it always
+	// watches, is never promoted to control, and cannot take it. A daemon
+	// without this field ignores it (the peer then joins as above).
+	Watch bool `json:"watch,omitempty"`
 }
 
 // StreamSpec describes an extra data channel (port forward, file transfer).

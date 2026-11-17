@@ -103,6 +103,7 @@ type peer struct {
 	low     chan struct{}
 	cid     string // client instance (supports roles); "" = legacy, single peer
 	seq     uint64 // join order
+	passive bool   // watches only (recorder): never controls
 }
 
 // promoteAfter: when the controller is gone this long (and did not reconnect,
@@ -631,7 +632,7 @@ func (d *Daemon) sendRole(p *peer, role string) {
 // take gives control to p (a viewer that asked for it).
 func (d *Daemon) take(p *peer) {
 	d.mu.Lock()
-	if !p.open || p.cid == "" || d.ctrl == p {
+	if !p.open || p.cid == "" || p.passive || d.ctrl == p {
 		d.mu.Unlock()
 		return
 	}
@@ -649,7 +650,7 @@ func (d *Daemon) promoteLocked() {
 	}
 	var best *peer
 	for p := range d.peers {
-		if p.open && p.cid != "" && (best == nil || p.seq < best.seq) {
+		if p.open && p.cid != "" && !p.passive && (best == nil || p.seq < best.seq) {
 			best = p
 		}
 	}
@@ -724,8 +725,8 @@ func (d *Daemon) handleOffer(m wire.Msg) (wire.Msg, error) {
 	if err != nil {
 		return wire.Msg{}, err
 	}
-	p := &peer{pc: pc, sent: m.RxOut, low: make(chan struct{}, 1), cid: m.CID}
-	join := m.Join && m.CID != ""
+	p := &peer{pc: pc, sent: m.RxOut, low: make(chan struct{}, 1), cid: m.CID, passive: m.Watch && m.CID != ""}
+	join := (m.Join || p.passive) && m.CID != ""
 
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
 		if spec, ok := stream.ParseLabel(dc.Label()); ok {
@@ -768,7 +769,7 @@ func (d *Daemon) handleOffer(m wire.Msg) (wire.Msg, error) {
 			d.peers[p] = true
 			p.open = true
 			d.everOpen = true
-			control := !join || sameAsCtrl || d.ctrl == nil
+			control := !p.passive && (!join || sameAsCtrl || d.ctrl == nil)
 			if control {
 				d.setCtrlLocked(p)
 			}
