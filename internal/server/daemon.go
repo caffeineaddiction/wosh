@@ -60,6 +60,7 @@ type Daemon struct {
 	out      *ring
 	inRx     uint64
 	peers    map[*peer]bool // open or opening peers
+	pending  map[*peer]bool // answered, data channel not open yet
 	ctrl     *peer          // the peer in control (input, resize, kill, forwards)
 	ctrlGone time.Time      // when the controller went away (viewers get promoted later)
 	joined   uint64         // peer join counter (oldest viewer is promoted first)
@@ -106,6 +107,10 @@ type peer struct {
 	cid     string // client instance (supports roles); "" = legacy, single peer
 	seq     uint64 // join order
 	passive bool   // watches only (recorder): never controls
+	dropped bool   // closed by TDrop: never (re)joins
+	// streams this peer opened or resumed (-L/-D): killed by TDrop rather
+	// than left waiting SuspendFor to be resumed
+	streams []*stream.Resumable
 }
 
 // promoteAfter: when the controller is gone this long (and did not reconnect,
@@ -143,6 +148,7 @@ func RunDaemon(opts DaemonOptions) error {
 		ln:      ln,
 		conns:   map[net.Conn]chan struct{}{},
 		peers:   map[*peer]bool{},
+		pending: map[*peer]bool{},
 		token:   newToken(),
 		rfwd:    map[int]net.Listener{},
 		streams: stream.NewRegistry(),
@@ -383,6 +389,14 @@ func (d *Daemon) serveConn(c net.Conn) {
 			}
 			_, _ = ptmx.Write([]byte(m.Text))
 			_ = enc.Encode(wire.Msg{T: wire.TOK})
+		case wire.TDrop:
+			// an embedding server revoked these peers: close their peer
+			// connections, which also ends every stream channel on them
+			d.dropPeers(m.CID)
+			_ = enc.Encode(wire.Msg{T: wire.TOK})
+		case wire.TKill:
+			_ = enc.Encode(wire.Msg{T: wire.TOK})
+			d.killSession()
 		case wire.TOpen:
 			// a local helper (ssh/scp shim) wants a stream to the client;
 			// after the reply the connection carries stream frames
@@ -734,10 +748,25 @@ func (d *Daemon) handleOffer(m wire.Msg) (wire.Msg, error) {
 	}
 	p := &peer{pc: pc, sent: m.RxOut, low: make(chan struct{}, 1), cid: m.CID, passive: m.Watch && m.CID != ""}
 	join := (m.Join || p.passive) && m.CID != ""
+	d.mu.Lock()
+	d.pending[p] = true
+	d.mu.Unlock()
 
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
 		if spec, ok := stream.ParseLabel(dc.Label()); ok {
-			if r, isNew := stream.Accept(dc, spec, d.streams.Get); isNew {
+			r, isNew := stream.Accept(dc, spec, d.streams.Get)
+			if r == nil {
+				return
+			}
+			d.mu.Lock()
+			p.streams = append(p.streams, r)
+			dropped := p.dropped
+			d.mu.Unlock()
+			if dropped {
+				r.Kill()
+				return
+			}
+			if isNew {
 				d.streams.Add(r)
 				go d.fromClient(r, spec)
 			}
@@ -757,6 +786,12 @@ func (d *Daemon) handleOffer(m wire.Msg) (wire.Msg, error) {
 		})
 		dc.OnOpen(func() {
 			d.mu.Lock()
+			delete(d.pending, p)
+			if p.dropped {
+				d.mu.Unlock()
+				_ = pc.Close()
+				return
+			}
 			// an earlier connection of the same client is stale (it roamed)
 			sameAsCtrl := false
 			for q := range d.peers {
@@ -804,6 +839,7 @@ func (d *Daemon) handleOffer(m wire.Msg) (wire.Msg, error) {
 		if s == webrtc.PeerConnectionStateFailed || s == webrtc.PeerConnectionStateClosed {
 			d.mu.Lock()
 			p.open = false
+			delete(d.pending, p)
 			if d.peers[p] {
 				delete(d.peers, p)
 				if d.ctrl == p {
@@ -924,17 +960,65 @@ func (d *Daemon) onFrame(p *peer, b []byte) {
 			d.take(p)
 		}
 	case wire.FKill:
-		d.mu.Lock()
-		cmd, exited := d.cmd, d.exited
-		d.mu.Unlock()
-		if cmd != nil && cmd.Process != nil && !exited {
-			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGHUP)
-			_ = cmd.Process.Signal(syscall.SIGHUP)
+		d.killSession()
+	}
+}
+
+// killSession hangs up the shell and ends the daemon shortly after (the
+// controller's FKill, or TKill on the control socket).
+func (d *Daemon) killSession() {
+	d.mu.Lock()
+	cmd, exited := d.cmd, d.exited
+	d.mu.Unlock()
+	if cmd != nil && cmd.Process != nil && !exited {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGHUP)
+		_ = cmd.Process.Signal(syscall.SIGHUP)
+	}
+	go func() {
+		time.Sleep(3 * time.Second)
+		d.stop()
+	}()
+}
+
+// dropPeers closes the peers of client instance cid (every peer if cid is
+// ""), including ones still connecting. Closing the peer connection ends its
+// data channels: the terminal and any stream channels on it.
+func (d *Daemon) dropPeers(cid string) {
+	d.mu.Lock()
+	var ps []*peer
+	for p := range d.pending {
+		if cid == "" || p.cid == cid {
+			p.dropped = true
+			delete(d.pending, p)
+			ps = append(ps, p)
 		}
-		go func() {
-			time.Sleep(3 * time.Second)
-			d.stop()
-		}()
+	}
+	for p := range d.peers {
+		if cid == "" || p.cid == cid {
+			p.dropped = true
+			p.open = false
+			delete(d.peers, p)
+			if d.ctrl == p {
+				d.ctrl = nil
+				d.ctrlGone = time.Now()
+			}
+			ps = append(ps, p)
+		}
+	}
+	var rs []*stream.Resumable
+	for _, p := range ps {
+		rs = append(rs, p.streams...)
+		p.streams = nil
+	}
+	d.mu.Unlock()
+	if len(ps) > 0 {
+		log.Printf("dropping %d peer(s) (cid %q)", len(ps), cid)
+	}
+	for _, p := range ps {
+		_ = p.pc.Close()
+	}
+	for _, r := range rs {
+		r.Kill()
 	}
 }
 

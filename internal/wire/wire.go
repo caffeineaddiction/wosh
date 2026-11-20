@@ -44,6 +44,8 @@ const (
 	TOpen      = "open"      // shim -> daemon: open a stream to the client, then raw frames
 	TInfo      = "info"      // shim -> daemon: who is the client (reply carries User)
 	TType      = "type"      // local tool -> daemon: type Text into the session (e.g. reload the shell)
+	TDrop      = "drop"      // local tool -> daemon: close the peers with CID (all peers if CID is "")
+	TKill      = "kill"      // local tool -> daemon: hang up the session and exit
 	TOK        = "ok"
 )
 
