@@ -76,10 +76,10 @@ technique and may be flagged by EDR; `vm.memfd_noexec=2` disables it.
   and PTYs, so the same protocol works over `ssh -T` pipes and in-band
   through a running session's terminal.
 * **Daemon** (`wosh _daemon`, detached, one per session): owns the PTY,
-  keeps an output ring addressed by absolute offset (4 MiB; a server that
-  starts `wosh _daemon` itself can pass `--ring 64M` to keep more
-  scrollback for reconnects, up to 512M, at several times that in memory;
-  `wosh server` and `wosh up` always use 4 MiB), accepts offers on
+  keeps an output ring addressed by absolute offset (4 MiB by default. A
+  server that starts `wosh _daemon` itself can pass `--ring 64M` to keep
+  more scrollback for reconnects, up to 512M, at several times that in
+  memory. `wosh server` and `wosh up` always use 4 MiB), accepts offers on
   a unix socket (`$XDG_RUNTIME_DIR/wosh/ID.sock`, 0700), replaces the peer
   connection on every reconnect.
 * **Relays**: `wosh server` (initial, over ssh, exits after answering),
