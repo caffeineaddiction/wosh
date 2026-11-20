@@ -47,7 +47,8 @@ type DaemonOptions struct {
 	OwnBinary string
 	// ICEInterfaces: gather candidates on these interfaces only (none: all).
 	ICEInterfaces []string
-	// RingSize: output bytes kept for reconnecting peers (0: ringSize).
+	// RingSize: output bytes kept for reconnecting peers (0: ringSize),
+	// clamped to MinRingSize..MaxRingSize.
 	RingSize int
 }
 
@@ -141,6 +142,7 @@ func RunDaemon(opts DaemonOptions) error {
 	if keep <= 0 {
 		keep = ringSize
 	}
+	keep = min(max(keep, MinRingSize), MaxRingSize)
 	d := &Daemon{
 		opts:    opts,
 		out:     newRing(keep),
