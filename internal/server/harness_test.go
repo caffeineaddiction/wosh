@@ -195,6 +195,10 @@ type testPeer struct {
 	role  string
 	inTx  uint64
 	acked bool
+	// info control frame: Out, and whether output arrived before it
+	infoOut       uint64
+	infoSeen      bool
+	outBeforeInfo bool
 }
 
 // connect makes a WebRTC peer and connects it through the control socket,
@@ -250,6 +254,8 @@ func (d *testDaemon) connect(cid string, join bool) *testPeer {
 		case wire.FControl:
 			if c, ok := wire.ParseControl(b); ok && c.Op == "role" {
 				p.role = c.Role
+			} else if ok && c.Op == "info" {
+				p.infoOut, p.infoSeen, p.outBeforeInfo = c.Out, true, p.out.Len() > 0
 			}
 		}
 	})
