@@ -4,6 +4,7 @@ package rtc
 import (
 	"context"
 	"io"
+	"net"
 	"os"
 	"strings"
 	"time"
@@ -44,6 +45,10 @@ func NewAPI(opts ...Option) *webrtc.API {
 		}
 		se.SetNetworkTypes(nts)
 	}
+	// WOSH_ICE_IFACES=lo,tailscale0: as the Interfaces option
+	if v := os.Getenv("WOSH_ICE_IFACES"); v != "" {
+		Interfaces(SplitList(v))(&se)
+	}
 	se.SetICETimeouts(3*time.Second, 8*time.Second, 1*time.Second)
 	se.SetICEMulticastDNSMode(ice.MulticastDNSModeDisabled)
 	if os.Getenv("WOSH_LOOPBACK") != "" {
@@ -53,6 +58,38 @@ func NewAPI(opts ...Option) *webrtc.API {
 		o(&se)
 	}
 	return webrtc.NewAPI(webrtc.WithSettingEngine(se))
+}
+
+// Interfaces gathers ICE candidates on the named interfaces only, e.g.
+// tailscale0 and lo, so a daemon never offers (or opens sockets on) LAN or
+// container addresses. A loopback interface in the list also enables
+// loopback candidates, which pion leaves out by default. An empty list
+// changes nothing.
+func Interfaces(names []string) Option {
+	return func(se *webrtc.SettingEngine) {
+		if len(names) == 0 {
+			return
+		}
+		allow := map[string]bool{}
+		for _, n := range names {
+			allow[n] = true
+			if i, err := net.InterfaceByName(n); err == nil && i.Flags&net.FlagLoopback != 0 {
+				se.SetIncludeLoopbackCandidate(true)
+			}
+		}
+		se.SetInterfaceFilter(func(name string) bool { return allow[name] })
+	}
+}
+
+// SplitList splits a comma separated list, dropping blanks.
+func SplitList(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // Config builds a peer connection configuration.

@@ -75,6 +75,10 @@ func newToken() string {
 	return hex.EncodeToString(b)
 }
 
+// keepEnv: WOSH_* variables the session shell inherits. The ICE limits
+// carry over to daemons started from inside the session (chained hops).
+var keepEnv = map[string]bool{"WOSH_RUNTIME_DIR": true, "WOSH_ICE_IFACES": true, "WOSH_LOOPBACK": true}
+
 // sessionEnv builds the environment of the session shell.
 func (d *Daemon) sessionEnv(term string, extra map[string]string) []string {
 	skip := map[string]bool{"TERM": true, "WOSH_SESSION": true, "WOSH_UNLINK": true}
@@ -85,7 +89,7 @@ func (d *Daemon) sessionEnv(term string, extra map[string]string) []string {
 	path := os.Getenv("PATH")
 	for _, e := range os.Environ() {
 		k, _, _ := strings.Cut(e, "=")
-		if skip[k] || strings.HasPrefix(k, "WOSH_") && k != "WOSH_RUNTIME_DIR" || k == "PATH" {
+		if skip[k] || strings.HasPrefix(k, "WOSH_") && !keepEnv[k] || k == "PATH" {
 			continue
 		}
 		env = append(env, e)

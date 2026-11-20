@@ -182,6 +182,12 @@ func daemon(args []string) {
 		case "--own-binary":
 			i++
 			o.OwnBinary = args[i]
+		case "--ice-iface":
+			if i+1 >= len(args) {
+				fatal("--ice-iface needs interface names, e.g. tailscale0,lo")
+			}
+			i++
+			o.ICEInterfaces = rtc.SplitList(args[i])
 		case "--":
 			o.Command = args[i+1:]
 			i = len(args)

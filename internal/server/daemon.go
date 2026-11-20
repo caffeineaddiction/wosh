@@ -45,6 +45,8 @@ type DaemonOptions struct {
 	// OwnBinary: pushed temp file this daemon runs from (no memfd); kept in
 	// the session bin dir and deleted with the session.
 	OwnBinary string
+	// ICEInterfaces: gather candidates on these interfaces only (none: all).
+	ICEInterfaces []string
 }
 
 // Daemon owns one PTY session and serves WebRTC peers for it.
@@ -154,6 +156,11 @@ func RunDaemon(opts DaemonOptions) error {
 		_ = opts.ReadyFD.Close()
 	}
 	log.Printf("daemon %s listening on %s", opts.ID, sock)
+	for _, n := range opts.ICEInterfaces {
+		if _, err := net.InterfaceByName(n); err != nil {
+			log.Printf("--ice-iface %s: %v (no candidates from it)", n, err)
+		}
+	}
 
 	go d.acceptLoop()
 	go d.sender()
@@ -721,7 +728,7 @@ func (d *Daemon) handleOffer(m wire.Msg) (wire.Msg, error) {
 	}
 	d.mu.Unlock()
 
-	pc, err := rtc.NewAPI().NewPeerConnection(rtc.Config(m.ICE, m.Relay))
+	pc, err := rtc.NewAPI(rtc.Interfaces(d.opts.ICEInterfaces)).NewPeerConnection(rtc.Config(m.ICE, m.Relay))
 	if err != nil {
 		return wire.Msg{}, err
 	}
