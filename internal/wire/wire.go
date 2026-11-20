@@ -47,7 +47,7 @@ const (
 	TDrop      = "drop"      // local tool -> daemon: close the peers with CID (all peers if CID is "")
 	TKill      = "kill"      // local tool -> daemon: hang up the session and exit
 	TTail      = "tail"      // local tool -> daemon: the last N output bytes (reply: ok with Data, Off)
-	TStart     = "start"     // local tool -> daemon: start the session with no peer (Term, Cols, Rows, Env, Key)
+	TStart     = "start"     // local tool -> daemon: start the session with no peer (Term, Cols, Rows, Env, Src, Key)
 	TStatus    = "status"    // local tool -> daemon: session state (reply: ok with Status)
 	TOK        = "ok"
 )
@@ -110,11 +110,11 @@ type Msg struct {
 
 // Status is a daemon's state, for a local tool managing sessions.
 type Status struct {
-	Started  bool         `json:"started"`             // the shell runs (or ran)
-	Exited   bool         `json:"exited"`              // the shell is gone
-	ExitCode int          `json:"exit_code,omitempty"` // when Exited
-	EverOpen bool         `json:"ever_open"`           // some peer connected at least once
-	Peers    []PeerStatus `json:"peers"`               // connected and connecting peers
+	Started  bool         `json:"started"`   // the shell runs (or ran)
+	Exited   bool         `json:"exited"`    // the shell is gone
+	ExitCode int          `json:"exit_code"` // the shell's exit code once Exited, else 0
+	EverOpen bool         `json:"ever_open"` // some peer connected at least once
+	Peers    []PeerStatus `json:"peers"`     // connected and connecting peers
 }
 
 // PeerStatus describes one peer in Status.

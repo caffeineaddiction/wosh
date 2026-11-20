@@ -86,6 +86,7 @@ type Daemon struct {
 	// exited first) we stop once no peer has been connected for a while.
 	exitDelivered bool
 	everOpen      bool // some peer connected at least once
+	headless      bool // a local tool started the session (TStart); it needs no peer
 	conns         map[net.Conn]chan struct{}
 
 	token      string // shared with the client; proves a chained hop's hello
@@ -211,6 +212,9 @@ func RunDaemon(opts DaemonOptions) error {
 	for p := range d.peers {
 		_ = p.pc.Close()
 	}
+	for p := range d.pending {
+		_ = p.pc.Close()
+	}
 	d.mu.Unlock()
 	for _, l := range d.rfwd {
 		_ = l.Close()
@@ -304,9 +308,9 @@ func (d *Daemon) watchdog() {
 			unreachableSince = time.Time{}
 		}
 		d.mu.Lock()
-		everOpen := d.everOpen
+		needsPeer := !d.everOpen && !d.headless
 		d.mu.Unlock()
-		if !everOpen && time.Since(start) > neverConnectedWait {
+		if needsPeer && time.Since(start) > neverConnectedWait {
 			log.Printf("no peer ever connected; giving up")
 			d.stop()
 			return
@@ -418,8 +422,12 @@ func (d *Daemon) serveConn(c net.Conn) {
 			d.mu.Lock()
 			ptmx := d.ptmx
 			d.mu.Unlock()
-			if ptmx == nil || len(m.Text) > 4096 {
+			if ptmx == nil {
 				_ = enc.Encode(wire.Msg{T: wire.TError, Err: "no session terminal"})
+				continue
+			}
+			if len(m.Text) > 4096 {
+				_ = enc.Encode(wire.Msg{T: wire.TError, Err: "text too long (max 4096 bytes)"})
 				continue
 			}
 			_, _ = ptmx.Write([]byte(m.Text))
@@ -473,6 +481,9 @@ func (d *Daemon) serveConn(c net.Conn) {
 		for p := range d.peers {
 			ps = append(ps, p)
 		}
+		for p := range d.pending {
+			ps = append(ps, p)
+		}
 		d.mu.Unlock()
 		if len(ps) > 0 {
 			log.Printf("anchor ssh closed: dropping peers so clients renegotiate")
@@ -484,9 +495,9 @@ func (d *Daemon) serveConn(c net.Conn) {
 }
 
 // startHeadless starts the session before any peer connects (TStart), so a
-// local tool can type into it. Term, Cols, Rows and Env are used as an
+// local tool can type into it. Term, Cols, Rows, Env and Src are used as an
 // offer's would be. Key, if given, becomes the session key that offers must
-// match; without it the first offer sets the key as before. Starting a
+// match. Without it, the first offer sets the key as before. Starting a
 // started session is a no-op (its key must still match, if given).
 func (d *Daemon) startHeadless(m wire.Msg) error {
 	d.mu.Lock()
@@ -504,11 +515,13 @@ func (d *Daemon) startHeadless(m wire.Msg) error {
 	if d.started {
 		return nil
 	}
+	d.src = m.Src   // later offers cannot change the running shell's WOSH_SRC
 	m.Agent = false // no client to forward an agent from
 	if err := d.startShell(m); err != nil {
 		return fmt.Errorf("start shell: %w", err)
 	}
 	d.started = true
+	d.headless = true // the tool owns it: no "no peer ever connected" timeout
 	return nil
 }
 
