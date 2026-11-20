@@ -186,7 +186,11 @@ func RunDaemon(opts DaemonOptions) error {
 	// the effective list: --ice-iface, else WOSH_ICE_IFACES (see rtc.NewAPI)
 	ifaces := opts.ICEInterfaces
 	if len(ifaces) == 0 {
-		ifaces = rtc.SplitList(os.Getenv("WOSH_ICE_IFACES"))
+		v := os.Getenv("WOSH_ICE_IFACES")
+		ifaces = rtc.SplitList(v)
+		if v != "" && len(ifaces) == 0 {
+			log.Printf("WOSH_ICE_IFACES=%q names no interface: no ICE candidates", v)
+		}
 	}
 	for _, n := range ifaces {
 		if i, err := net.InterfaceByName(n); err != nil {

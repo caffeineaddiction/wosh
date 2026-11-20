@@ -47,7 +47,13 @@ func NewAPI(opts ...Option) *webrtc.API {
 	}
 	// WOSH_ICE_IFACES=lo,tailscale0: as the Interfaces option
 	if v := os.Getenv("WOSH_ICE_IFACES"); v != "" {
-		Interfaces(SplitList(v))(&se)
+		names := SplitList(v)
+		if len(names) == 0 {
+			// set but no names (","): fail closed, as --ice-iface does,
+			// rather than lift the limit
+			se.SetInterfaceFilter(func(string) bool { return false })
+		}
+		Interfaces(names)(&se)
 	}
 	se.SetICETimeouts(3*time.Second, 8*time.Second, 1*time.Second)
 	se.SetICEMulticastDNSMode(ice.MulticastDNSModeDisabled)
