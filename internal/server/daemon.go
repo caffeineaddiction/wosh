@@ -68,6 +68,7 @@ type Daemon struct {
 	ptmx     *os.File
 	cmd      *exec.Cmd
 	out      *ring
+	ctrlOut  uint64 // output sent to a controller, which answered its queries
 	inRx     uint64
 	peers    map[*peer]bool // open or opening peers
 	pending  map[*peer]bool // offer being answered or answered, data channel not open yet
@@ -701,6 +702,9 @@ func (d *Daemon) sendTo(p *peer) bool {
 	}
 	frame := wire.OffsetFrame(wire.FOutput, off, data)
 	p.sent = off + uint64(len(data))
+	if p == d.ctrl {
+		d.ctrlOut = max(d.ctrlOut, p.sent)
+	}
 	d.mu.Unlock()
 	if err := p.dc.Send(frame); err != nil {
 		return false
@@ -921,7 +925,10 @@ func (d *Daemon) handleOffer(m wire.Msg) (wire.Msg, error) {
 				}
 			}
 			hadCtrl := d.ctrl != nil
-			outEnd := d.out.end() // output below this is replay for the new peer
+			// replay for the new peer: output a controller already got. Not the
+			// ring end, which holds startup output (the shell starts before the
+			// first peer connects) and output made while no one had control.
+			outEnd := d.ctrlOut
 			d.joined++
 			p.seq = d.joined
 			d.peers[p] = true

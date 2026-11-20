@@ -12,9 +12,21 @@ func TestInfoOutputEnd(t *testing.T) {
 	d := startDaemon(t)
 	a := d.connect("aaaa", false)
 	a.typ("echo before-$((2*21))\r")
-	a.waitOutput("before-42", 10*time.Second)
-	time.Sleep(300 * time.Millisecond) // let the next prompt arrive too
+	// the prompt after the output: the shell is idle, so the output stops here
+	waitUntil(t, "prompt after before-42", 10*time.Second, func() bool {
+		o := a.output()
+		i := strings.Index(o, "before-42")
+		return i >= 0 && strings.HasSuffix(o[i:], "$ ")
+	})
 	seen := uint64(len(a.output()))
+	a.mu.Lock()
+	aOut, aSeen := a.infoOut, a.infoSeen
+	a.mu.Unlock()
+	// the shell started before a connected, but nobody answered its startup
+	// queries: none of it is replay
+	if !aSeen || aOut != 0 {
+		t.Fatalf("first peer: info seen %v, out %d, want 0", aSeen, aOut)
+	}
 
 	b := d.connect("bbbb", true) // replays the ring from offset 0
 	b.waitOutput("before-42", 10*time.Second)
@@ -27,6 +39,7 @@ func TestInfoOutputEnd(t *testing.T) {
 	if infoOut != seen {
 		t.Fatalf("info out %d, session output was %d", infoOut, seen)
 	}
+	waitUntil(t, "replay up to info out", 10*time.Second, func() bool { return uint64(len(b.output())) >= infoOut })
 	if !strings.Contains(b.output()[:infoOut], "before-42") {
 		t.Fatal("replayed output is not below info out")
 	}
