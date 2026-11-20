@@ -17,14 +17,17 @@ type ring struct {
 func newRing(max int) *ring { return &ring{max: max} }
 
 // Ring size limits for `_daemon --ring`. The ring holds up to twice its size
-// before trimming, so 512M stays clear of a 32-bit int.
+// before trimming, so 512M stays clear of a 32-bit int. Memory is higher:
+// append regrows the slice to about 2.4x the size, and a trim allocates a
+// new copy, so the heap peaks near 5x the size (measured at 64M).
 const (
 	MinRingSize = 64 << 10
 	MaxRingSize = 512 << 20
 )
 
 // ParseSize parses a ring size: bytes, or a number with a K, M or G suffix
-// (binary units; "KiB", "MB" and lowercase forms are accepted too).
+// (binary units; "KiB", "MB" and lowercase forms are accepted too). Every G
+// value is over MaxRingSize; G parses only so the error names the limit.
 func ParseSize(s string) (int, error) {
 	t := strings.ToUpper(strings.TrimSpace(s))
 	t = strings.TrimSuffix(strings.TrimSuffix(t, "B"), "I")
