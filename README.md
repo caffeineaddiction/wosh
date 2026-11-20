@@ -108,9 +108,10 @@ technique and may be flagged by EDR; `vm.memfd_noexec=2` disables it.
   after 5 s.
 * **Embedding**: a server that relays offers to the control socket (a
   browser front end) can also cut peers off and end sessions there.
-  `{"t":"drop","cid":"X"}` closes client X's peers (all peers without a
-  cid), with their stream channels; the session keeps running.
-  `{"t":"kill"}` hangs up the session. Both reply `{"t":"ok"}`.
+  `{"t":"drop","cid":"X"}` closes client X's peers and ends its forwarded
+  connections. Without a cid it drops every peer. The session keeps running.
+  `{"t":"kill"}` hangs up the session and refuses new offers until the
+  daemon exits. Both reply `{"t":"ok"}`.
 * **Headless sessions**: `{"t":"start","key":K,"term":T,"cols":C,"rows":R,"env":{}}`
   on the control socket starts the shell before any peer connects, so
   `type` works at once; offers must then carry key K. `{"t":"status"}`

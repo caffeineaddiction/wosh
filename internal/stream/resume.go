@@ -429,8 +429,9 @@ func (g *Registry) Get(id string) *Resumable {
 	return g.m[id]
 }
 
-// ReopenAll re-attaches every stream this side opened over a new connection.
-func (g *Registry) ReopenAll(pc *webrtc.PeerConnection) {
+// ReopenAll re-attaches every stream this side opened over a new connection
+// and returns them.
+func (g *Registry) ReopenAll(pc *webrtc.PeerConnection) []*Resumable {
 	g.mu.Lock()
 	var rs []*Resumable
 	for _, r := range g.m {
@@ -446,6 +447,7 @@ func (g *Registry) ReopenAll(pc *webrtc.PeerConnection) {
 			}
 		}(r)
 	}
+	return rs
 }
 
 // KillAll drops every stream (endpoint gone).
