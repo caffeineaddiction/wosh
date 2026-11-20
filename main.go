@@ -188,6 +188,8 @@ func daemon(args []string) {
 			}
 			i++
 			o.ICEInterfaces = rtc.SplitList(args[i])
+		case "--no-forward":
+			o.NoForward = true
 		case "--":
 			o.Command = args[i+1:]
 			i = len(args)
