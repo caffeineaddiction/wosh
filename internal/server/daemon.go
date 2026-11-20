@@ -393,6 +393,14 @@ func (d *Daemon) serveConn(c net.Conn) {
 			u, src := d.clientUser, d.src
 			d.mu.Unlock()
 			_ = enc.Encode(wire.Msg{T: wire.TInfo, User: u, Src: src})
+		case wire.TStart:
+			if err := d.startHeadless(m); err != nil {
+				_ = enc.Encode(wire.Msg{T: wire.TError, Err: err.Error()})
+				continue
+			}
+			_ = enc.Encode(wire.Msg{T: wire.TOK})
+		case wire.TStatus:
+			_ = enc.Encode(wire.Msg{T: wire.TOK, Status: d.status()})
 		case wire.TType:
 			d.mu.Lock()
 			ptmx := d.ptmx
@@ -460,6 +468,56 @@ func (d *Daemon) serveConn(c net.Conn) {
 			_ = p.pc.Close()
 		}
 	}
+}
+
+// startHeadless starts the session before any peer connects (TStart), so a
+// local tool can type into it. Term, Cols, Rows and Env are used as an
+// offer's would be. Key, if given, becomes the session key that offers must
+// match; without it the first offer sets the key as before. Starting a
+// started session is a no-op (its key must still match, if given).
+func (d *Daemon) startHeadless(m wire.Msg) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if m.Key != "" {
+		switch {
+		case d.key == "" && len(m.Key) < 16:
+			return errors.New("session key too short")
+		case d.key == "":
+			d.key = m.Key
+		case subtle.ConstantTimeCompare([]byte(d.key), []byte(m.Key)) != 1:
+			return errors.New("bad session key")
+		}
+	}
+	if d.started {
+		return nil
+	}
+	m.Agent = false // no client to forward an agent from
+	if err := d.startShell(m); err != nil {
+		return fmt.Errorf("start shell: %w", err)
+	}
+	d.started = true
+	return nil
+}
+
+// status reports the session state and its peers (TStatus).
+func (d *Daemon) status() *wire.Status {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	st := &wire.Status{Started: d.started, Exited: d.exited, EverOpen: d.everOpen, Peers: []wire.PeerStatus{}}
+	if d.exited {
+		st.ExitCode = d.exitCode
+	}
+	for p := range d.peers {
+		role := "view"
+		if p == d.ctrl {
+			role = "control"
+		}
+		st.Peers = append(st.Peers, wire.PeerStatus{CID: p.cid, Role: role, Passive: p.passive})
+	}
+	for p := range d.pending {
+		st.Peers = append(st.Peers, wire.PeerStatus{CID: p.cid, Role: "pending", Passive: p.passive})
+	}
+	return st
 }
 
 // --- session ----------------------------------------------------------------

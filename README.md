@@ -111,6 +111,11 @@ technique and may be flagged by EDR; `vm.memfd_noexec=2` disables it.
   `{"t":"drop","cid":"X"}` closes client X's peers (all peers without a
   cid), with their stream channels; the session keeps running.
   `{"t":"kill"}` hangs up the session. Both reply `{"t":"ok"}`.
+* **Headless sessions**: `{"t":"start","key":K,"term":T,"cols":C,"rows":R,"env":{}}`
+  on the control socket starts the shell before any peer connects, so
+  `type` works at once; offers must then carry key K. `{"t":"status"}`
+  replies `{"t":"ok","status":{started, exited, exit_code, ever_open,
+  peers:[{cid, role: control|view|pending, passive}]}}`.
 * **Roaming**: 1 s pings (6 s timeout), ICE failure, or a local address
   disappearing trigger reconnect. Root sessions re-run ssh (`BatchMode`) with
   `attach`; nested sessions wait for their parent, then signal through it.

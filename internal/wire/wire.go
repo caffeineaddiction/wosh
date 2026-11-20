@@ -47,6 +47,8 @@ const (
 	TDrop      = "drop"      // local tool -> daemon: close the peers with CID (all peers if CID is "")
 	TKill      = "kill"      // local tool -> daemon: hang up the session and exit
 	TTail      = "tail"      // local tool -> daemon: the last N output bytes (reply: ok with Data, Off)
+	TStart     = "start"     // local tool -> daemon: start the session with no peer (Term, Cols, Rows, Env, Key)
+	TStatus    = "status"    // local tool -> daemon: session state (reply: ok with Status)
 	TOK        = "ok"
 )
 
@@ -90,6 +92,7 @@ type Msg struct {
 	N      int               `json:"n,omitempty"`      // control socket: bytes wanted by TTail
 	Data   []byte            `json:"data,omitempty"`   // control socket: TTail reply bytes (base64 in JSON)
 	Off    uint64            `json:"off,omitempty"`    // control socket: output offset of Data[0]
+	Status *Status           `json:"status,omitempty"` // control socket: TStatus reply
 
 	// Shared sessions. A client that sets CID (stable for one client instance,
 	// across its reconnects) supports roles: several such peers may watch one
@@ -103,6 +106,22 @@ type Msg struct {
 	// watches, is never promoted to control, and cannot take it. A daemon
 	// without this field ignores it (the peer then joins as above).
 	Watch bool `json:"watch,omitempty"`
+}
+
+// Status is a daemon's state, for a local tool managing sessions.
+type Status struct {
+	Started  bool         `json:"started"`             // the shell runs (or ran)
+	Exited   bool         `json:"exited"`              // the shell is gone
+	ExitCode int          `json:"exit_code,omitempty"` // when Exited
+	EverOpen bool         `json:"ever_open"`           // some peer connected at least once
+	Peers    []PeerStatus `json:"peers"`               // connected and connecting peers
+}
+
+// PeerStatus describes one peer in Status.
+type PeerStatus struct {
+	CID     string `json:"cid,omitempty"`
+	Role    string `json:"role"` // control, view, or pending (data channel not open yet)
+	Passive bool   `json:"passive,omitempty"`
 }
 
 // StreamSpec describes an extra data channel (port forward, file transfer).
