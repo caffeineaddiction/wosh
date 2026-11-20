@@ -150,6 +150,12 @@ func TestKillBeforeStart(t *testing.T) {
 	if r := d.ctl(wire.Msg{T: wire.TOffer, Key: d.key, SDP: "v=0"}); r.T != wire.TError || !strings.Contains(r.Err, "killed") {
 		t.Fatalf("offer after kill: %+v", r)
 	}
+	if r := d.ctl(wire.Msg{T: wire.TStart, Key: d.key}); r.T != wire.TError || !strings.Contains(r.Err, "killed") {
+		t.Fatalf("start after kill: %+v", r)
+	}
+	if st := d.status(); st != nil && st.Started {
+		t.Fatalf("a shell started after kill: %+v", st)
+	}
 	if !d.exited(10 * time.Second) {
 		t.Fatal("daemon still running after kill")
 	}

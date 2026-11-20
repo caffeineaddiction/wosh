@@ -213,7 +213,9 @@ func RunDaemon(opts DaemonOptions) error {
 		_ = p.pc.Close()
 	}
 	for p := range d.pending {
-		_ = p.pc.Close()
+		if p.pc != nil { // nil: handleOffer is still creating it
+			_ = p.pc.Close()
+		}
 	}
 	d.mu.Unlock()
 	for _, l := range d.rfwd {
@@ -483,19 +485,21 @@ func (d *Daemon) serveConn(c net.Conn) {
 		// the goodbye still gets through, so the client reconnects at once
 		// (and the new offer is probed) instead of waiting for a timeout.
 		d.mu.Lock()
-		var ps []*peer
+		var pcs []*webrtc.PeerConnection
 		for p := range d.peers {
-			ps = append(ps, p)
+			pcs = append(pcs, p.pc)
 		}
 		for p := range d.pending {
-			ps = append(ps, p)
+			if p.pc != nil { // nil: handleOffer is still creating it
+				pcs = append(pcs, p.pc)
+			}
 		}
 		d.mu.Unlock()
-		if len(ps) > 0 {
+		if len(pcs) > 0 {
 			log.Printf("anchor ssh closed: dropping peers so clients renegotiate")
 		}
-		for _, p := range ps {
-			_ = p.pc.Close()
+		for _, pc := range pcs {
+			_ = pc.Close()
 		}
 	}
 }
@@ -517,6 +521,9 @@ func (d *Daemon) startHeadless(m wire.Msg) error {
 		case subtle.ConstantTimeCompare([]byte(d.key), []byte(m.Key)) != 1:
 			return errors.New("bad session key")
 		}
+	}
+	if d.killed {
+		return errors.New("session killed") // as handleOffer: no shell after a kill
 	}
 	if d.started {
 		return nil

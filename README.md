@@ -115,8 +115,8 @@ technique and may be flagged by EDR; `vm.memfd_noexec=2` disables it.
   browser front end) can also cut peers off and end sessions there.
   `{"t":"drop","cid":"X"}` closes client X's peers and ends its forwarded
   connections. Without a cid it drops every peer. The session keeps running.
-  `{"t":"kill"}` hangs up the session and refuses new offers until the
-  daemon exits. Both reply `{"t":"ok"}`.
+  `{"t":"kill"}` hangs up the session and refuses new offers and starts
+  until the daemon exits. Both reply `{"t":"ok"}`.
 * **Headless sessions**: `{"t":"start","key":K,"term":T,"cols":C,"rows":R,"env":{},"src":S}`
   on the control socket starts the shell before any peer connects, so
   `type` works at once. Offers must then carry key K. The shell keeps the
