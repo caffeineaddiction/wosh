@@ -47,6 +47,8 @@ type DaemonOptions struct {
 	OwnBinary string
 	// ICEInterfaces: gather candidates on these interfaces only (none: all).
 	ICEInterfaces []string
+	// RingSize: output bytes kept for reconnecting peers (0: ringSize).
+	RingSize int
 }
 
 // Daemon owns one PTY session and serves WebRTC peers for it.
@@ -140,9 +142,13 @@ func RunDaemon(opts DaemonOptions) error {
 		}
 	}()
 
+	keep := opts.RingSize
+	if keep <= 0 {
+		keep = ringSize
+	}
 	d := &Daemon{
 		opts:    opts,
-		out:     newRing(ringSize),
+		out:     newRing(keep),
 		kick:    make(chan struct{}, 1),
 		quit:    make(chan struct{}),
 		ln:      ln,
