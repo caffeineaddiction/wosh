@@ -198,6 +198,8 @@ func daemon(args []string) {
 				fatal("bad --ring: %v", err)
 			}
 			o.RingSize = n
+		case "--no-forward":
+			o.NoForward = true
 		case "--":
 			o.Command = args[i+1:]
 			i = len(args)

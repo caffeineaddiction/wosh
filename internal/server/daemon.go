@@ -49,7 +49,12 @@ type DaemonOptions struct {
 	ICEInterfaces []string
 	// RingSize: output bytes kept for reconnecting peers (0: ringSize).
 	RingSize int
+	// NoForward refuses every stream: -L/-D dials, -R listeners, the agent
+	// socket and src: transfers. The session is a terminal and nothing else.
+	NoForward bool
 }
+
+var errNoForward = errors.New("forwarding is disabled on this session")
 
 // Daemon owns one PTY session and serves WebRTC peers for it.
 type Daemon struct {
@@ -462,7 +467,7 @@ func (d *Daemon) startShell(m wire.Msg) error {
 		term = "xterm-256color"
 	}
 	env := m.Env
-	if m.Agent && d.baseDir != "" {
+	if m.Agent && d.baseDir != "" && !d.opts.NoForward {
 		if sock, err := d.listenAgent(); err == nil {
 			env = maps.Clone(env)
 			if env == nil {
@@ -960,7 +965,7 @@ func (d *Daemon) onFrame(p *peer, b []byte) {
 		c, ok := wire.ParseControl(b)
 		switch {
 		case !ok:
-		case c.Op == "rfwd" && d.isCtrl(p):
+		case c.Op == "rfwd" && d.isCtrl(p) && !d.opts.NoForward:
 			d.listenRemote(c.Rfwd)
 		case c.Op == "take":
 			d.take(p)
@@ -1032,6 +1037,9 @@ func (d *Daemon) dropPeers(cid string) {
 
 // openToClient opens a stream from this host to the client.
 func (d *Daemon) openToClient(spec wire.StreamSpec) (*stream.Resumable, error) {
+	if d.opts.NoForward {
+		return nil, errNoForward
+	}
 	deadline := time.Now().Add(20 * time.Second)
 	for {
 		d.mu.Lock()
@@ -1054,6 +1062,11 @@ func (d *Daemon) openToClient(spec wire.StreamSpec) (*stream.Resumable, error) {
 // fromClient serves a stream the client opened: -L / -D forwards, which this
 // host dials (like ssh's direct-tcpip).
 func (d *Daemon) fromClient(ch stream.Conn, spec wire.StreamSpec) {
+	if d.opts.NoForward {
+		_ = ch.Send(stream.Err, []byte(errNoForward.Error()))
+		_ = ch.Close()
+		return
+	}
 	if spec.K != "tcp" || spec.Port <= 0 || spec.Port > 65535 {
 		_ = ch.Send(stream.Err, []byte("unsupported stream"))
 		_ = ch.Close()
