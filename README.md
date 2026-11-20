@@ -102,6 +102,11 @@ technique and may be flagged by EDR; `vm.memfd_noexec=2` disables it.
   removed, e.g. by a test or a logout without linger) can never be reached
   again; once no client is connected either, it hangs up the shell and exits
   after 5 s.
+* **Headless sessions**: `{"t":"start","key":K,"term":T,"cols":C,"rows":R,"env":{}}`
+  on the control socket starts the shell before any peer connects, so
+  `type` works at once; offers must then carry key K. `{"t":"status"}`
+  replies `{"t":"ok","status":{started, exited, exit_code, ever_open,
+  peers:[{cid, role: control|view|pending, passive}]}}`.
 * **Roaming**: 1 s pings (6 s timeout), ICE failure, or a local address
   disappearing trigger reconnect. Root sessions re-run ssh (`BatchMode`) with
   `attach`; nested sessions wait for their parent, then signal through it.

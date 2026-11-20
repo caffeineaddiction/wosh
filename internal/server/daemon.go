@@ -60,6 +60,7 @@ type Daemon struct {
 	out      *ring
 	inRx     uint64
 	peers    map[*peer]bool // open or opening peers
+	pending  map[*peer]bool // answered, data channel not open yet
 	ctrl     *peer          // the peer in control (input, resize, kill, forwards)
 	ctrlGone time.Time      // when the controller went away (viewers get promoted later)
 	joined   uint64         // peer join counter (oldest viewer is promoted first)
@@ -143,6 +144,7 @@ func RunDaemon(opts DaemonOptions) error {
 		ln:      ln,
 		conns:   map[net.Conn]chan struct{}{},
 		peers:   map[*peer]bool{},
+		pending: map[*peer]bool{},
 		token:   newToken(),
 		rfwd:    map[int]net.Listener{},
 		streams: stream.NewRegistry(),
@@ -373,6 +375,14 @@ func (d *Daemon) serveConn(c net.Conn) {
 			u, src := d.clientUser, d.src
 			d.mu.Unlock()
 			_ = enc.Encode(wire.Msg{T: wire.TInfo, User: u, Src: src})
+		case wire.TStart:
+			if err := d.startHeadless(m); err != nil {
+				_ = enc.Encode(wire.Msg{T: wire.TError, Err: err.Error()})
+				continue
+			}
+			_ = enc.Encode(wire.Msg{T: wire.TOK})
+		case wire.TStatus:
+			_ = enc.Encode(wire.Msg{T: wire.TOK, Status: d.status()})
 		case wire.TType:
 			d.mu.Lock()
 			ptmx := d.ptmx
@@ -420,6 +430,56 @@ func (d *Daemon) serveConn(c net.Conn) {
 			_ = p.pc.Close()
 		}
 	}
+}
+
+// startHeadless starts the session before any peer connects (TStart), so a
+// local tool can type into it. Term, Cols, Rows and Env are used as an
+// offer's would be. Key, if given, becomes the session key that offers must
+// match; without it the first offer sets the key as before. Starting a
+// started session is a no-op (its key must still match, if given).
+func (d *Daemon) startHeadless(m wire.Msg) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if m.Key != "" {
+		switch {
+		case d.key == "" && len(m.Key) < 16:
+			return errors.New("session key too short")
+		case d.key == "":
+			d.key = m.Key
+		case subtle.ConstantTimeCompare([]byte(d.key), []byte(m.Key)) != 1:
+			return errors.New("bad session key")
+		}
+	}
+	if d.started {
+		return nil
+	}
+	m.Agent = false // no client to forward an agent from
+	if err := d.startShell(m); err != nil {
+		return fmt.Errorf("start shell: %w", err)
+	}
+	d.started = true
+	return nil
+}
+
+// status reports the session state and its peers (TStatus).
+func (d *Daemon) status() *wire.Status {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	st := &wire.Status{Started: d.started, Exited: d.exited, EverOpen: d.everOpen, Peers: []wire.PeerStatus{}}
+	if d.exited {
+		st.ExitCode = d.exitCode
+	}
+	for p := range d.peers {
+		role := "view"
+		if p == d.ctrl {
+			role = "control"
+		}
+		st.Peers = append(st.Peers, wire.PeerStatus{CID: p.cid, Role: role, Passive: p.passive})
+	}
+	for p := range d.pending {
+		st.Peers = append(st.Peers, wire.PeerStatus{CID: p.cid, Role: "pending", Passive: p.passive})
+	}
+	return st
 }
 
 // --- session ----------------------------------------------------------------
@@ -734,6 +794,9 @@ func (d *Daemon) handleOffer(m wire.Msg) (wire.Msg, error) {
 	}
 	p := &peer{pc: pc, sent: m.RxOut, low: make(chan struct{}, 1), cid: m.CID, passive: m.Watch && m.CID != ""}
 	join := (m.Join || p.passive) && m.CID != ""
+	d.mu.Lock()
+	d.pending[p] = true
+	d.mu.Unlock()
 
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
 		if spec, ok := stream.ParseLabel(dc.Label()); ok {
@@ -757,6 +820,7 @@ func (d *Daemon) handleOffer(m wire.Msg) (wire.Msg, error) {
 		})
 		dc.OnOpen(func() {
 			d.mu.Lock()
+			delete(d.pending, p)
 			// an earlier connection of the same client is stale (it roamed)
 			sameAsCtrl := false
 			for q := range d.peers {
@@ -804,6 +868,7 @@ func (d *Daemon) handleOffer(m wire.Msg) (wire.Msg, error) {
 		if s == webrtc.PeerConnectionStateFailed || s == webrtc.PeerConnectionStateClosed {
 			d.mu.Lock()
 			p.open = false
+			delete(d.pending, p)
 			if d.peers[p] {
 				delete(d.peers, p)
 				if d.ctrl == p {
