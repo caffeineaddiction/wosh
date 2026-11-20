@@ -21,6 +21,16 @@ func (r *ring) append(p []byte) {
 	}
 }
 
+// tail returns a copy of the last n retained bytes and the offset of the
+// first one.
+func (r *ring) tail(n int) ([]byte, uint64) {
+	if n > len(r.data) {
+		n = len(r.data)
+	}
+	i := len(r.data) - n
+	return append([]byte(nil), r.data[i:]...), r.start + uint64(i)
+}
+
 // slice returns up to n bytes starting at off (clamped to what is retained)
 // and the offset actually used.
 func (r *ring) slice(off uint64, n int) ([]byte, uint64) {

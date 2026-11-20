@@ -32,6 +32,8 @@ const (
 	ringSize       = 4 << 20
 	maxBuffered    = 1 << 20
 	firstOfferWait = 60 * time.Second
+	defaultTail    = 64 << 10 // TTail without N
+	maxTail        = 1 << 20
 	// bootstrap failed for good (client gave up): don't leave a shell behind
 	neverConnectedWait = 3 * time.Minute
 )
@@ -383,6 +385,18 @@ func (d *Daemon) serveConn(c net.Conn) {
 			}
 			_, _ = ptmx.Write([]byte(m.Text))
 			_ = enc.Encode(wire.Msg{T: wire.TOK})
+		case wire.TTail:
+			// recent output for a local tool (e.g. a "what is on screen"
+			// peek) without connecting a peer
+			n := m.N
+			if n <= 0 {
+				n = defaultTail
+			}
+			n = min(n, maxTail)
+			d.mu.Lock()
+			data, off := d.out.tail(n)
+			d.mu.Unlock()
+			_ = enc.Encode(wire.Msg{T: wire.TOK, Data: data, Off: off})
 		case wire.TOpen:
 			// a local helper (ssh/scp shim) wants a stream to the client;
 			// after the reply the connection carries stream frames

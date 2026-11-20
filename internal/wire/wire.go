@@ -44,6 +44,7 @@ const (
 	TOpen      = "open"      // shim -> daemon: open a stream to the client, then raw frames
 	TInfo      = "info"      // shim -> daemon: who is the client (reply carries User)
 	TType      = "type"      // local tool -> daemon: type Text into the session (e.g. reload the shell)
+	TTail      = "tail"      // local tool -> daemon: the last N output bytes (reply: ok with Data, Off)
 	TOK        = "ok"
 )
 
@@ -84,6 +85,9 @@ type Msg struct {
 	Agent  bool              `json:"agent,omitempty"`  // offer: forward the client's ssh-agent
 	Stream *StreamSpec       `json:"stream,omitempty"` // control socket: open a stream to the client
 	Text   string            `json:"text,omitempty"`   // control socket: input for TType
+	N      int               `json:"n,omitempty"`      // control socket: bytes wanted by TTail
+	Data   []byte            `json:"data,omitempty"`   // control socket: TTail reply bytes (base64 in JSON)
+	Off    uint64            `json:"off,omitempty"`    // control socket: output offset of Data[0]
 
 	// Shared sessions. A client that sets CID (stable for one client instance,
 	// across its reconnects) supports roles: several such peers may watch one

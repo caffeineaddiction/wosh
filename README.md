@@ -105,6 +105,10 @@ technique and may be flagged by EDR; `vm.memfd_noexec=2` disables it.
 * **Roaming**: 1 s pings (6 s timeout), ICE failure, or a local address
   disappearing trigger reconnect. Root sessions re-run ssh (`BatchMode`) with
   `attach`; nested sessions wait for their parent, then signal through it.
+* **Peeking at a session**: `{"t":"tail","n":65536}` on the control socket
+  returns the last n output bytes (default 64 KiB, at most 1 MiB) as
+  `{"t":"ok","data":"<base64>","off":<offset of the first byte>}`, without
+  connecting a peer.
 
 ## Typing on slow links (predictive echo)
 
