@@ -76,7 +76,8 @@ technique and may be flagged by EDR; `vm.memfd_noexec=2` disables it.
   and PTYs, so the same protocol works over `ssh -T` pipes and in-band
   through a running session's terminal.
 * **Daemon** (`wosh _daemon`, detached, one per session): owns the PTY,
-  keeps a 4 MiB output ring addressed by absolute offset, accepts offers on
+  keeps an output ring addressed by absolute offset (4 MiB; `--ring 64M`
+  keeps more scrollback for reconnects, up to 512M), accepts offers on
   a unix socket (`$XDG_RUNTIME_DIR/wosh/ID.sock`, 0700), replaces the peer
   connection on every reconnect.
 * **Relays**: `wosh server` (initial, over ssh, exits after answering),

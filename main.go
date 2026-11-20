@@ -188,6 +188,16 @@ func daemon(args []string) {
 			}
 			i++
 			o.ICEInterfaces = rtc.SplitList(args[i])
+		case "--ring":
+			if i+1 >= len(args) {
+				fatal("--ring needs a size, e.g. 64M")
+			}
+			i++
+			n, err := server.ParseSize(args[i])
+			if err != nil {
+				fatal("bad --ring: %v", err)
+			}
+			o.RingSize = n
 		case "--":
 			o.Command = args[i+1:]
 			i = len(args)
