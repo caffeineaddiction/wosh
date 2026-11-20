@@ -447,7 +447,9 @@ func (d *Daemon) startShell(m wire.Msg) error {
 		term = "xterm-256color"
 	}
 	env := m.Env
-	if m.Agent && d.baseDir != "" && !d.opts.NoForward {
+	if m.Agent && d.opts.NoForward {
+		log.Printf("agent forwarding refused: %v", errNoForward)
+	} else if m.Agent && d.baseDir != "" {
 		if sock, err := d.listenAgent(); err == nil {
 			env = maps.Clone(env)
 			if env == nil {
@@ -923,7 +925,11 @@ func (d *Daemon) onFrame(p *peer, b []byte) {
 		c, ok := wire.ParseControl(b)
 		switch {
 		case !ok:
-		case c.Op == "rfwd" && d.isCtrl(p) && !d.opts.NoForward:
+		case c.Op == "rfwd" && d.opts.NoForward:
+			if len(c.Rfwd) > 0 {
+				log.Printf("-R refused: %v", errNoForward)
+			}
+		case c.Op == "rfwd" && d.isCtrl(p):
 			d.listenRemote(c.Rfwd)
 		case c.Op == "take":
 			d.take(p)

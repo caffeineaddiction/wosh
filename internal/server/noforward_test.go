@@ -58,7 +58,10 @@ func TestNoForward(t *testing.T) {
 			}
 
 			// -R: the controller asks the daemon to listen
-			pl, _ := net.Listen("tcp", "127.0.0.1:0")
+			pl, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
 			port := pl.Addr().(*net.TCPAddr).Port
 			_ = pl.Close()
 			_ = a.dc.Send(wire.ControlFrame(wire.Control{Op: "rfwd", Rfwd: []wire.RemoteFwd{{ID: 1, Bind: "127.0.0.1", Port: port}}}))
