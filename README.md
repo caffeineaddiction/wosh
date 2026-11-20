@@ -91,6 +91,9 @@ technique and may be flagged by EDR; `vm.memfd_noexec=2` disables it.
   output. An offer with `join` only takes control if nobody has it; a
   watcher asks for control with a `{"op":"take"}` control frame, and the
   daemon tells each peer its role (`{"op":"role","role":"control"|"view"}`).
+  Before any output, each peer gets `{"op":"info","out":N}`: output below
+  offset N is replay, so a terminal should not answer queries (DSR, DA)
+  found there; they were answered when they were new.
   When the controller is gone for 10 s, the longest watcher gets control.
   An offer with `watch` (and a cid) is a passive peer, such as wash's
   recorder: it always watches, is never promoted and cannot take control.

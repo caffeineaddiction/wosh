@@ -106,6 +106,7 @@ type peer struct {
 	cid     string // client instance (supports roles); "" = legacy, single peer
 	seq     uint64 // join order
 	passive bool   // watches only (recorder): never controls
+	greeted bool   // ack, info, role and size sent: output may follow
 }
 
 // promoteAfter: when the controller is gone this long (and did not reconnect,
@@ -559,7 +560,7 @@ func (d *Daemon) sendTo(p *peer) bool {
 		return false
 	}
 	d.mu.Lock()
-	if !p.open {
+	if !p.open || !p.greeted {
 		d.mu.Unlock()
 		return false
 	}
@@ -771,6 +772,7 @@ func (d *Daemon) handleOffer(m wire.Msg) (wire.Msg, error) {
 				}
 			}
 			hadCtrl := d.ctrl != nil
+			outEnd := d.out.end() // output below this is replay for the new peer
 			d.joined++
 			p.seq = d.joined
 			d.peers[p] = true
@@ -784,7 +786,7 @@ func (d *Daemon) handleOffer(m wire.Msg) (wire.Msg, error) {
 			role := map[bool]string{true: "control", false: "view"}[control]
 			log.Printf("peer connected (%s%s)", role, map[bool]string{true: ", " + p.cid, false: ""}[p.cid != ""])
 			_ = dc.Send(wire.U64Frame(wire.FAck, d.inputRx()))
-			_ = dc.Send(wire.ControlFrame(wire.Control{Op: "info", Token: d.token}))
+			_ = dc.Send(wire.ControlFrame(wire.Control{Op: "info", Token: d.token, Out: outEnd}))
 			if p.cid != "" {
 				_ = dc.Send(wire.ControlFrame(wire.Control{Op: "role", Role: role}))
 				if c, r := d.size(); c > 0 {
@@ -795,6 +797,9 @@ func (d *Daemon) handleOffer(m wire.Msg) (wire.Msg, error) {
 				// streams we opened (-R, src:, agent) continue on the new link
 				d.streams.ReopenAll(pc)
 			}
+			d.mu.Lock()
+			p.greeted = true // output may follow: info (with Out) went first
+			d.mu.Unlock()
 			d.poke()
 		})
 		dc.OnMessage(func(msg webrtc.DataChannelMessage) { d.onFrame(p, msg.Data) })

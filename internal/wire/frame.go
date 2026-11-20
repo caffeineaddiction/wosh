@@ -86,6 +86,7 @@ type Control struct {
 	Cols  uint16      `json:"cols,omitempty"` // size: the session terminal (set by the controller)
 	Rows  uint16      `json:"rows,omitempty"`
 	Token string      `json:"token,omitempty"` // info: session token for chained hops
+	Out   uint64      `json:"out,omitempty"`   // info: output offset at connect; below it is replay (don't answer queries there)
 	Rfwd  []RemoteFwd `json:"rfwd,omitempty"`  // rfwd: remote forwards to listen on
 }
 
