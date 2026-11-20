@@ -373,7 +373,13 @@ func (d *Daemon) serveConn(c net.Conn) {
 		d.mu.Unlock()
 		close(gone)
 	}()
-	go func() { <-d.quit; c.Close() }()
+	go func() {
+		select {
+		case <-d.quit:
+			c.Close()
+		case <-gone: // connection done: don't park until the daemon exits
+		}
+	}()
 	r := bufio.NewReaderSize(c, 64*1024)
 	enc := json.NewEncoder(c)
 	anchored := false
