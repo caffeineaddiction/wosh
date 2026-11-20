@@ -93,13 +93,21 @@ func startDaemon(t *testing.T, args ...string) *testDaemon {
 	}
 	bin := woshBinary(t)
 	tmp := t.TempDir()
-	rt := filepath.Join(tmp, "rt")
+	// short runtime dir: t.TempDir() embeds the test name, and the control
+	// socket path must fit sun_path (104 bytes on macOS)
+	rt, err := os.MkdirTemp("", "wosh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(rt) })
 	lo := loopbackIface(t)
 	id := NewID()
 	r, w, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer r.Close()
+	defer w.Close()
 	argv := append([]string{"_daemon", "--id", id, "--ice-iface", lo}, args...)
 	argv = append(argv, "--", "/bin/sh")
 	cmd := exec.Command(bin, argv...)
@@ -112,6 +120,7 @@ func startDaemon(t *testing.T, args ...string) *testDaemon {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer lf.Close()
 	cmd.Stdout, cmd.Stderr = lf, lf
 	cmd.ExtraFiles = []*os.File{w} // fd 3: ready
 	if err := cmd.Start(); err != nil {
@@ -144,7 +153,6 @@ func startDaemon(t *testing.T, args ...string) *testDaemon {
 	case <-time.After(10 * time.Second):
 		t.Fatal("daemon not ready")
 	}
-	_ = r.Close()
 	return d
 }
 
@@ -359,4 +367,8 @@ func TestICEInterfaces(t *testing.T) {
 	if n == 0 {
 		t.Fatal("no candidates in the answer")
 	}
+	// the limit carries over to the session shell, for daemons started there
+	waitUntil(t, "control role", 10*time.Second, func() bool { return p.currentRole() == "control" })
+	p.typ("echo ifaces=$WOSH_ICE_IFACES.\r")
+	p.waitOutput("ifaces="+loopbackIface(t)+".", 10*time.Second)
 }

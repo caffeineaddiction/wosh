@@ -156,9 +156,16 @@ func RunDaemon(opts DaemonOptions) error {
 		_ = opts.ReadyFD.Close()
 	}
 	log.Printf("daemon %s listening on %s", opts.ID, sock)
-	for _, n := range opts.ICEInterfaces {
-		if _, err := net.InterfaceByName(n); err != nil {
-			log.Printf("--ice-iface %s: %v (no candidates from it)", n, err)
+	// the effective list: --ice-iface, else WOSH_ICE_IFACES (see rtc.NewAPI)
+	ifaces := opts.ICEInterfaces
+	if len(ifaces) == 0 {
+		ifaces = rtc.SplitList(os.Getenv("WOSH_ICE_IFACES"))
+	}
+	for _, n := range ifaces {
+		if i, err := net.InterfaceByName(n); err != nil {
+			log.Printf("ICE interface %s: %v (no candidates from it until it exists)", n, err)
+		} else if i.Flags&net.FlagUp == 0 {
+			log.Printf("ICE interface %s is down (no candidates from it until it is up)", n)
 		}
 	}
 
