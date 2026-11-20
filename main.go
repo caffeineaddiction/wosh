@@ -187,7 +187,7 @@ func daemon(args []string) {
 				fatal("--ice-iface needs interface names, e.g. tailscale0,lo")
 			}
 			i++
-			o.ICEInterfaces = rtc.SplitList(args[i])
+			o.ICEInterfaces = iceIfaces(args[i])
 		case "--ring":
 			if i+1 >= len(args) {
 				fatal("--ring needs a size, e.g. 64M")
@@ -203,6 +203,10 @@ func daemon(args []string) {
 		case "--":
 			o.Command = args[i+1:]
 			i = len(args)
+		default:
+			if v, ok := strings.CutPrefix(args[i], "--ice-iface="); ok {
+				o.ICEInterfaces = iceIfaces(v)
+			}
 		}
 	}
 	o.ReadyFD = os.NewFile(3, "ready")
@@ -211,6 +215,16 @@ func daemon(args []string) {
 	if err := server.RunDaemon(o); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// iceIfaces parses an --ice-iface value. An empty list would silently lift
+// the limit, so it is an error.
+func iceIfaces(v string) []string {
+	l := rtc.SplitList(v)
+	if len(l) == 0 || strings.HasPrefix(v, "-") {
+		fatal("--ice-iface needs interface names, e.g. tailscale0,lo")
+	}
+	return l
 }
 
 func runClient(args []string) int {

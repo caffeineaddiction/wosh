@@ -234,15 +234,16 @@ Debugging: `WOSH_SIM_DELAY=250ms` (client delays everything it receives,
 to try high-latency behaviour such as prediction on a fast link),
 `WOSH_DEBUG=1` (verbose pion logs), `WOSH_ICE_NET=udp4|udp6`
 (restrict candidates), `WOSH_ICE_IFACES=lo,tailscale0` (gather candidates
-on these interfaces only, like `wosh _daemon --ice-iface`; session shells
-inherit it), `WOSH_KEEP_LOGS=1` (keep daemon logs); `~s` shows
+on these interfaces only, like `wosh _daemon --ice-iface`, and session
+shells inherit it), `WOSH_KEEP_LOGS=1` (keep daemon logs); `~s` shows
 the selected candidate pair.
 
 `wosh _daemon --ice-iface tailscale0,lo` keeps a daemon's ICE candidates,
 and the UDP sockets behind them, to the named interfaces: no LAN or
 container addresses in the answer. A loopback interface in the list also
-enables loopback candidates. Each candidate appears twice in an answer
-(ICE components 1 and 2); both lines name the same socket.
+enables loopback candidates. The session shell gets the list as
+`WOSH_ICE_IFACES`. Each candidate appears twice in an answer (ICE
+components 1 and 2). Both lines name the same socket.
 
 ## Security notes
 
