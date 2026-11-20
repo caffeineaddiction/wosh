@@ -206,7 +206,11 @@ func daemon(args []string) {
 		default:
 			if v, ok := strings.CutPrefix(args[i], "--ice-iface="); ok {
 				o.ICEInterfaces = iceIfaces(v)
+				continue
 			}
+			// fail closed: a misspelled --no-forward must not start a
+			// daemon that forwards
+			fatal("_daemon: unknown argument %q", args[i])
 		}
 	}
 	o.ReadyFD = os.NewFile(3, "ready")

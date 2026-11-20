@@ -256,10 +256,11 @@ components 1 and 2). Both lines name the same socket.
 * Any program printing to the terminal can emit a `hello`; the client
   therefore **asks** before upgrading (unless `--yes`) and only reacts to
   the foreground session.
-* Any peer of a session can open forwards (a watcher can dial with -L;
-  the controller can listen with -R). A daemon started with
-  `wosh _daemon --no-forward` refuses every stream instead: no -L/-D dials,
-  no -R listeners, no agent socket, no src: transfers. Use it when the
+* Any peer of a session can open forwards. A watcher can dial with -L, and
+  the controller can listen with -R. A daemon started with
+  `wosh _daemon --no-forward` refuses every stream instead: no -L or -D
+  dials, no -R listeners, no agent socket, no src: transfers, and no wosh
+  builds fetched from the client for a chained hop. Use it when the
   session is only a terminal, e.g. behind a browser front end.
 * STUN reveals your public IP to the STUN server; `--relay` forces TURN.
   TURN credentials given to the client are passed to the remote daemons.
