@@ -125,7 +125,7 @@ type peer struct {
 	seq     uint64 // join order
 	passive bool   // watches only (recorder): never controls
 	dropped bool   // closed by TDrop: never (re)joins
-	greeted bool // ack, info, role and size sent: output may follow
+	greeted bool   // ack, info, role and size sent: output may follow
 }
 
 // promoteAfter: when the controller is gone this long (and did not reconnect,
