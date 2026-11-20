@@ -29,6 +29,9 @@ func TestRingTail(t *testing.T) {
 	if r.data[0] == 99 {
 		t.Fatal("tail aliases the ring")
 	}
+	if b, off := r.tail(-1); len(b) != 0 || off != r.end() {
+		t.Fatalf("tail -1: %v %d", b, off)
+	}
 }
 
 // TestTailOp: tail returns the recent output, with its offset, before and

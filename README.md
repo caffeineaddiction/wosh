@@ -125,7 +125,10 @@ technique and may be flagged by EDR; `vm.memfd_noexec=2` disables it.
 * **Peeking at a session**: `{"t":"tail","n":65536}` on the control socket
   returns the last n output bytes (default 64 KiB, at most 1 MiB) as
   `{"t":"ok","data":"<base64>","off":<offset of the first byte>}`, without
-  connecting a peer.
+  connecting a peer. `data` and `off` are left out when empty or 0. The bytes
+  are raw output, so they may start inside a UTF-8 character or an escape
+  sequence. The reply line can reach about 1.4 MB. Daemons older than this op
+  send no reply, so read it with a timeout.
 
 ## Typing on slow links (predictive echo)
 
