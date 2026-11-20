@@ -193,6 +193,10 @@ func daemon(args []string) {
 		case "--":
 			o.Command = args[i+1:]
 			i = len(args)
+		default:
+			// fail closed: a misspelled --no-forward must not start a
+			// daemon that forwards
+			fatal("_daemon: unknown argument %q", args[i])
 		}
 	}
 	o.ReadyFD = os.NewFile(3, "ready")
