@@ -104,9 +104,10 @@ technique and may be flagged by EDR; `vm.memfd_noexec=2` disables it.
   after 5 s.
 * **Embedding**: a server that relays offers to the control socket (a
   browser front end) can also cut peers off and end sessions there.
-  `{"t":"drop","cid":"X"}` closes client X's peers (all peers without a
-  cid), with their stream channels; the session keeps running.
-  `{"t":"kill"}` hangs up the session. Both reply `{"t":"ok"}`.
+  `{"t":"drop","cid":"X"}` closes client X's peers and ends its forwarded
+  connections. Without a cid it drops every peer. The session keeps running.
+  `{"t":"kill"}` hangs up the session and refuses new offers until the
+  daemon exits. Both reply `{"t":"ok"}`.
 * **Roaming**: 1 s pings (6 s timeout), ICE failure, or a local address
   disappearing trigger reconnect. Root sessions re-run ssh (`BatchMode`) with
   `attach`; nested sessions wait for their parent, then signal through it.
