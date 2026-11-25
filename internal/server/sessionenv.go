@@ -75,6 +75,11 @@ func newToken() string {
 	return hex.EncodeToString(b)
 }
 
+// keepEnv: WOSH_* variables the session shell inherits. The ICE limits
+// carry over to daemons started from inside the session (chained hops).
+// --ice-iface carries over too, as WOSH_ICE_IFACES (see sessionEnv).
+var keepEnv = map[string]bool{"WOSH_RUNTIME_DIR": true, "WOSH_ICE_IFACES": true, "WOSH_LOOPBACK": true}
+
 // sessionEnv builds the environment of the session shell.
 func (d *Daemon) sessionEnv(term string, extra map[string]string) []string {
 	skip := map[string]bool{"TERM": true, "WOSH_SESSION": true, "WOSH_UNLINK": true}
@@ -82,10 +87,16 @@ func (d *Daemon) sessionEnv(term string, extra map[string]string) []string {
 		skip[k] = true
 	}
 	var env []string
+	// --ice-iface wins over an inherited WOSH_ICE_IFACES, as in rtc.NewAPI;
+	// an explicit --env from the client still wins over both
+	if _, set := extra["WOSH_ICE_IFACES"]; !set && len(d.opts.ICEInterfaces) > 0 {
+		skip["WOSH_ICE_IFACES"] = true
+		env = append(env, "WOSH_ICE_IFACES="+strings.Join(d.opts.ICEInterfaces, ","))
+	}
 	path := os.Getenv("PATH")
 	for _, e := range os.Environ() {
 		k, _, _ := strings.Cut(e, "=")
-		if skip[k] || strings.HasPrefix(k, "WOSH_") && k != "WOSH_RUNTIME_DIR" || k == "PATH" {
+		if skip[k] || strings.HasPrefix(k, "WOSH_") && !keepEnv[k] || k == "PATH" {
 			continue
 		}
 		env = append(env, e)

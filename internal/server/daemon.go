@@ -32,6 +32,8 @@ const (
 	ringSize       = 4 << 20
 	maxBuffered    = 1 << 20
 	firstOfferWait = 60 * time.Second
+	defaultTail    = 64 << 10 // TTail without N
+	maxTail        = 1 << 20
 	// bootstrap failed for good (client gave up): don't leave a shell behind
 	neverConnectedWait = 3 * time.Minute
 )
@@ -45,7 +47,17 @@ type DaemonOptions struct {
 	// OwnBinary: pushed temp file this daemon runs from (no memfd); kept in
 	// the session bin dir and deleted with the session.
 	OwnBinary string
+	// ICEInterfaces: gather candidates on these interfaces only (none: all).
+	ICEInterfaces []string
+	// RingSize: output bytes kept for reconnecting peers (0: ringSize),
+	// clamped to MinRingSize..MaxRingSize.
+	RingSize int
+	// NoForward refuses every stream: -L/-D dials, -R listeners, the agent
+	// socket and src: transfers. The session is a terminal and nothing else.
+	NoForward bool
 }
+
+var errNoForward = errors.New("forwarding is disabled on this session")
 
 // Daemon owns one PTY session and serves WebRTC peers for it.
 type Daemon struct {
@@ -56,8 +68,10 @@ type Daemon struct {
 	ptmx     *os.File
 	cmd      *exec.Cmd
 	out      *ring
+	ctrlOut  uint64 // output sent to a controller, which answered its queries
 	inRx     uint64
 	peers    map[*peer]bool // open or opening peers
+	pending  map[*peer]bool // offer being answered or answered, data channel not open yet
 	ctrl     *peer          // the peer in control (input, resize, kill, forwards)
 	ctrlGone time.Time      // when the controller went away (viewers get promoted later)
 	joined   uint64         // peer join counter (oldest viewer is promoted first)
@@ -72,6 +86,7 @@ type Daemon struct {
 	// exited first) we stop once no peer has been connected for a while.
 	exitDelivered bool
 	everOpen      bool // some peer connected at least once
+	headless      bool // a local tool started the session (TStart); it needs no peer
 	conns         map[net.Conn]chan struct{}
 
 	token      string // shared with the client; proves a chained hop's hello
@@ -83,6 +98,11 @@ type Daemon struct {
 	inLog      []inputMark // input written to the pty, for echo acks
 	echoed     uint64
 	streams    *stream.Registry
+	// owned: streams by client instance (cid), the -L/-D streams it opened
+	// and the ones this daemon opened to it as controller. TDrop ends them
+	// at once, also when they are detached after a reconnect.
+	owned  map[string][]*stream.Resumable
+	killed bool // FKill or TKill: no new peers, the daemon stops shortly
 
 	sock     string      // control socket path
 	sockInfo os.FileInfo // ...and the file we created (a new daemon may reuse the path)
@@ -104,6 +124,8 @@ type peer struct {
 	cid     string // client instance (supports roles); "" = legacy, single peer
 	seq     uint64 // join order
 	passive bool   // watches only (recorder): never controls
+	dropped bool   // closed by TDrop: never (re)joins
+	greeted bool   // ack, info, role and size sent: output may follow
 }
 
 // promoteAfter: when the controller is gone this long (and did not reconnect,
@@ -133,14 +155,21 @@ func RunDaemon(opts DaemonOptions) error {
 		}
 	}()
 
+	keep := opts.RingSize
+	if keep <= 0 {
+		keep = ringSize
+	}
+	keep = min(max(keep, MinRingSize), MaxRingSize)
 	d := &Daemon{
 		opts:    opts,
-		out:     newRing(ringSize),
+		out:     newRing(keep),
 		kick:    make(chan struct{}, 1),
 		quit:    make(chan struct{}),
 		ln:      ln,
 		conns:   map[net.Conn]chan struct{}{},
 		peers:   map[*peer]bool{},
+		pending: map[*peer]bool{},
+		owned:   map[string][]*stream.Resumable{},
 		token:   newToken(),
 		rfwd:    map[int]net.Listener{},
 		streams: stream.NewRegistry(),
@@ -154,6 +183,22 @@ func RunDaemon(opts DaemonOptions) error {
 		_ = opts.ReadyFD.Close()
 	}
 	log.Printf("daemon %s listening on %s", opts.ID, sock)
+	// the effective list: --ice-iface, else WOSH_ICE_IFACES (see rtc.NewAPI)
+	ifaces := opts.ICEInterfaces
+	if len(ifaces) == 0 {
+		v := os.Getenv("WOSH_ICE_IFACES")
+		ifaces = rtc.SplitList(v)
+		if v != "" && len(ifaces) == 0 {
+			log.Printf("WOSH_ICE_IFACES=%q names no interface: no ICE candidates", v)
+		}
+	}
+	for _, n := range ifaces {
+		if i, err := net.InterfaceByName(n); err != nil {
+			log.Printf("ICE interface %s: %v (no candidates from it until it exists)", n, err)
+		} else if i.Flags&net.FlagUp == 0 {
+			log.Printf("ICE interface %s is down (no candidates from it until it is up)", n)
+		}
+	}
 
 	go d.acceptLoop()
 	go d.sender()
@@ -170,6 +215,11 @@ func RunDaemon(opts DaemonOptions) error {
 	d.mu.Lock()
 	for p := range d.peers {
 		_ = p.pc.Close()
+	}
+	for p := range d.pending {
+		if p.pc != nil { // nil: handleOffer is still creating it
+			_ = p.pc.Close()
+		}
 	}
 	d.mu.Unlock()
 	for _, l := range d.rfwd {
@@ -264,9 +314,9 @@ func (d *Daemon) watchdog() {
 			unreachableSince = time.Time{}
 		}
 		d.mu.Lock()
-		everOpen := d.everOpen
+		needsPeer := !d.everOpen && !d.headless
 		d.mu.Unlock()
-		if !everOpen && time.Since(start) > neverConnectedWait {
+		if needsPeer && time.Since(start) > neverConnectedWait {
 			log.Printf("no peer ever connected; giving up")
 			d.stop()
 			return
@@ -329,7 +379,13 @@ func (d *Daemon) serveConn(c net.Conn) {
 		d.mu.Unlock()
 		close(gone)
 	}()
-	go func() { <-d.quit; c.Close() }()
+	go func() {
+		select {
+		case <-d.quit:
+			c.Close()
+		case <-gone: // connection done: don't park until the daemon exits
+		}
+	}()
 	r := bufio.NewReaderSize(c, 64*1024)
 	enc := json.NewEncoder(c)
 	anchored := false
@@ -366,16 +422,48 @@ func (d *Daemon) serveConn(c net.Conn) {
 			u, src := d.clientUser, d.src
 			d.mu.Unlock()
 			_ = enc.Encode(wire.Msg{T: wire.TInfo, User: u, Src: src})
+		case wire.TStart:
+			if err := d.startHeadless(m); err != nil {
+				_ = enc.Encode(wire.Msg{T: wire.TError, Err: err.Error()})
+				continue
+			}
+			_ = enc.Encode(wire.Msg{T: wire.TOK})
+		case wire.TStatus:
+			_ = enc.Encode(wire.Msg{T: wire.TOK, Status: d.status()})
 		case wire.TType:
 			d.mu.Lock()
 			ptmx := d.ptmx
 			d.mu.Unlock()
-			if ptmx == nil || len(m.Text) > 4096 {
+			if ptmx == nil {
 				_ = enc.Encode(wire.Msg{T: wire.TError, Err: "no session terminal"})
+				continue
+			}
+			if len(m.Text) > 4096 {
+				_ = enc.Encode(wire.Msg{T: wire.TError, Err: "text too long (max 4096 bytes)"})
 				continue
 			}
 			_, _ = ptmx.Write([]byte(m.Text))
 			_ = enc.Encode(wire.Msg{T: wire.TOK})
+		case wire.TDrop:
+			// an embedding server revoked these peers: close their peer
+			// connections, which also ends every stream channel on them
+			d.dropPeers(m.CID)
+			_ = enc.Encode(wire.Msg{T: wire.TOK})
+		case wire.TKill:
+			_ = enc.Encode(wire.Msg{T: wire.TOK})
+			d.killSession()
+		case wire.TTail:
+			// recent output for a local tool (e.g. a "what is on screen"
+			// peek) without connecting a peer
+			n := m.N
+			if n <= 0 {
+				n = defaultTail
+			}
+			n = min(n, maxTail)
+			d.mu.Lock()
+			data, off := d.out.tail(n)
+			d.mu.Unlock()
+			_ = enc.Encode(wire.Msg{T: wire.TOK, Data: data, Off: off})
 		case wire.TOpen:
 			// a local helper (ssh/scp shim) wants a stream to the client;
 			// after the reply the connection carries stream frames
@@ -401,18 +489,78 @@ func (d *Daemon) serveConn(c net.Conn) {
 		// the goodbye still gets through, so the client reconnects at once
 		// (and the new offer is probed) instead of waiting for a timeout.
 		d.mu.Lock()
-		var ps []*peer
+		var pcs []*webrtc.PeerConnection
 		for p := range d.peers {
-			ps = append(ps, p)
+			pcs = append(pcs, p.pc)
+		}
+		for p := range d.pending {
+			if p.pc != nil { // nil: handleOffer is still creating it
+				pcs = append(pcs, p.pc)
+			}
 		}
 		d.mu.Unlock()
-		if len(ps) > 0 {
+		if len(pcs) > 0 {
 			log.Printf("anchor ssh closed: dropping peers so clients renegotiate")
 		}
-		for _, p := range ps {
-			_ = p.pc.Close()
+		for _, pc := range pcs {
+			_ = pc.Close()
 		}
 	}
+}
+
+// startHeadless starts the session before any peer connects (TStart), so a
+// local tool can type into it. Term, Cols, Rows, Env and Src are used as an
+// offer's would be. Key, if given, becomes the session key that offers must
+// match. Without it, the first offer sets the key as before. Starting a
+// started session is a no-op (its key must still match, if given).
+func (d *Daemon) startHeadless(m wire.Msg) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if m.Key != "" {
+		switch {
+		case d.key == "" && len(m.Key) < 16:
+			return errors.New("session key too short")
+		case d.key == "":
+			d.key = m.Key
+		case subtle.ConstantTimeCompare([]byte(d.key), []byte(m.Key)) != 1:
+			return errors.New("bad session key")
+		}
+	}
+	if d.killed {
+		return errors.New("session killed") // as handleOffer: no shell after a kill
+	}
+	if d.started {
+		return nil
+	}
+	d.src = m.Src   // later offers cannot change the running shell's WOSH_SRC
+	m.Agent = false // no client to forward an agent from
+	if err := d.startShell(m); err != nil {
+		return fmt.Errorf("start shell: %w", err)
+	}
+	d.started = true
+	d.headless = true // the tool owns it: no "no peer ever connected" timeout
+	return nil
+}
+
+// status reports the session state and its peers (TStatus).
+func (d *Daemon) status() *wire.Status {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	st := &wire.Status{Started: d.started, Exited: d.exited, EverOpen: d.everOpen, Peers: []wire.PeerStatus{}}
+	if d.exited {
+		st.ExitCode = d.exitCode
+	}
+	for p := range d.peers {
+		role := "view"
+		if p == d.ctrl {
+			role = "control"
+		}
+		st.Peers = append(st.Peers, wire.PeerStatus{CID: p.cid, Role: role, Passive: p.passive})
+	}
+	for p := range d.pending {
+		st.Peers = append(st.Peers, wire.PeerStatus{CID: p.cid, Role: "pending", Passive: p.passive})
+	}
+	return st
 }
 
 // --- session ----------------------------------------------------------------
@@ -435,7 +583,9 @@ func (d *Daemon) startShell(m wire.Msg) error {
 		term = "xterm-256color"
 	}
 	env := m.Env
-	if m.Agent && d.baseDir != "" {
+	if m.Agent && d.opts.NoForward {
+		log.Printf("agent forwarding refused: %v", errNoForward)
+	} else if m.Agent && d.baseDir != "" {
 		if sock, err := d.listenAgent(); err == nil {
 			env = maps.Clone(env)
 			if env == nil {
@@ -552,7 +702,7 @@ func (d *Daemon) sendTo(p *peer) bool {
 		return false
 	}
 	d.mu.Lock()
-	if !p.open {
+	if !p.open || !p.greeted {
 		d.mu.Unlock()
 		return false
 	}
@@ -582,6 +732,9 @@ func (d *Daemon) sendTo(p *peer) bool {
 	}
 	frame := wire.OffsetFrame(wire.FOutput, off, data)
 	p.sent = off + uint64(len(data))
+	if p == d.ctrl {
+		d.ctrlOut = max(d.ctrlOut, p.sent)
+	}
 	d.mu.Unlock()
 	if err := p.dc.Send(frame); err != nil {
 		return false
@@ -708,6 +861,10 @@ func (d *Daemon) handleOffer(m wire.Msg) (wire.Msg, error) {
 		d.mu.Unlock()
 		return wire.Msg{}, errors.New("bad session key")
 	}
+	if d.killed {
+		d.mu.Unlock()
+		return wire.Msg{}, errors.New("session killed")
+	}
 	if m.User != "" {
 		d.clientUser = m.User
 	}
@@ -719,19 +876,47 @@ func (d *Daemon) handleOffer(m wire.Msg) (wire.Msg, error) {
 		}
 		d.started = true
 	}
+	// pending from here on: a TDrop while the peer connection is set up
+	// drops this peer too
+	p := &peer{sent: m.RxOut, low: make(chan struct{}, 1), cid: m.CID, passive: m.Watch && m.CID != ""}
+	d.pending[p] = true
 	d.mu.Unlock()
 
-	pc, err := rtc.NewAPI().NewPeerConnection(rtc.Config(m.ICE, m.Relay))
+	pc, err := rtc.NewAPI(rtc.Interfaces(d.opts.ICEInterfaces)).NewPeerConnection(rtc.Config(m.ICE, m.Relay))
 	if err != nil {
+		d.mu.Lock()
+		delete(d.pending, p)
+		d.mu.Unlock()
 		return wire.Msg{}, err
 	}
-	p := &peer{pc: pc, sent: m.RxOut, low: make(chan struct{}, 1), cid: m.CID, passive: m.Watch && m.CID != ""}
+	d.mu.Lock()
+	p.pc = pc
+	dropped := p.dropped
+	d.mu.Unlock()
+	if dropped {
+		_ = pc.Close()
+		return wire.Msg{}, errors.New("peer dropped")
+	}
 	join := (m.Join || p.passive) && m.CID != ""
 
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
 		if spec, ok := stream.ParseLabel(dc.Label()); ok {
-			if r, isNew := stream.Accept(dc, spec, d.streams.Get); isNew {
+			r, isNew := stream.Accept(dc, spec, d.streams.Get)
+			if r == nil {
+				return
+			}
+			d.mu.Lock()
+			if p.dropped {
+				d.mu.Unlock()
+				r.Kill()
+				return
+			}
+			if isNew {
 				d.streams.Add(r)
+			}
+			d.ownLocked(p.cid, r)
+			d.mu.Unlock()
+			if isNew {
 				go d.fromClient(r, spec)
 			}
 			return
@@ -750,6 +935,12 @@ func (d *Daemon) handleOffer(m wire.Msg) (wire.Msg, error) {
 		})
 		dc.OnOpen(func() {
 			d.mu.Lock()
+			delete(d.pending, p)
+			if p.dropped {
+				d.mu.Unlock()
+				_ = pc.Close()
+				return
+			}
 			// an earlier connection of the same client is stale (it roamed)
 			sameAsCtrl := false
 			for q := range d.peers {
@@ -764,6 +955,10 @@ func (d *Daemon) handleOffer(m wire.Msg) (wire.Msg, error) {
 				}
 			}
 			hadCtrl := d.ctrl != nil
+			// replay for the new peer: output a controller already got. Not the
+			// ring end, which holds startup output (the shell starts before the
+			// first peer connects) and output made while no one had control.
+			outEnd := d.ctrlOut
 			d.joined++
 			p.seq = d.joined
 			d.peers[p] = true
@@ -777,7 +972,7 @@ func (d *Daemon) handleOffer(m wire.Msg) (wire.Msg, error) {
 			role := map[bool]string{true: "control", false: "view"}[control]
 			log.Printf("peer connected (%s%s)", role, map[bool]string{true: ", " + p.cid, false: ""}[p.cid != ""])
 			_ = dc.Send(wire.U64Frame(wire.FAck, d.inputRx()))
-			_ = dc.Send(wire.ControlFrame(wire.Control{Op: "info", Token: d.token}))
+			_ = dc.Send(wire.ControlFrame(wire.Control{Op: "info", Token: d.token, Out: outEnd}))
 			if p.cid != "" {
 				_ = dc.Send(wire.ControlFrame(wire.Control{Op: "role", Role: role}))
 				if c, r := d.size(); c > 0 {
@@ -785,9 +980,26 @@ func (d *Daemon) handleOffer(m wire.Msg) (wire.Msg, error) {
 				}
 			}
 			if control && (hadCtrl || sameAsCtrl) {
-				// streams we opened (-R, src:, agent) continue on the new link
-				d.streams.ReopenAll(pc)
+				// streams we opened (-R, src:, agent) continue on the new link,
+				// so they now belong to this client (TDrop of it ends them)
+				rs := d.streams.ReopenAll(pc)
+				d.mu.Lock()
+				dropped := p.dropped
+				for _, r := range rs {
+					if !dropped {
+						d.ownLocked(p.cid, r)
+					}
+				}
+				d.mu.Unlock()
+				if dropped {
+					for _, r := range rs {
+						r.Kill()
+					}
+				}
 			}
+			d.mu.Lock()
+			p.greeted = true // output may follow: info (with Out) went first
+			d.mu.Unlock()
 			d.poke()
 		})
 		dc.OnMessage(func(msg webrtc.DataChannelMessage) { d.onFrame(p, msg.Data) })
@@ -797,6 +1009,7 @@ func (d *Daemon) handleOffer(m wire.Msg) (wire.Msg, error) {
 		if s == webrtc.PeerConnectionStateFailed || s == webrtc.PeerConnectionStateClosed {
 			d.mu.Lock()
 			p.open = false
+			delete(d.pending, p)
 			if d.peers[p] {
 				delete(d.peers, p)
 				if d.ctrl == p {
@@ -911,30 +1124,115 @@ func (d *Daemon) onFrame(p *peer, b []byte) {
 		c, ok := wire.ParseControl(b)
 		switch {
 		case !ok:
+		case c.Op == "rfwd" && d.opts.NoForward:
+			if len(c.Rfwd) > 0 {
+				log.Printf("-R refused: %v", errNoForward)
+			}
 		case c.Op == "rfwd" && d.isCtrl(p):
 			d.listenRemote(c.Rfwd)
 		case c.Op == "take":
 			d.take(p)
 		}
 	case wire.FKill:
-		d.mu.Lock()
-		cmd, exited := d.cmd, d.exited
-		d.mu.Unlock()
-		if cmd != nil && cmd.Process != nil && !exited {
-			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGHUP)
-			_ = cmd.Process.Signal(syscall.SIGHUP)
-		}
-		go func() {
-			time.Sleep(3 * time.Second)
-			d.stop()
-		}()
+		d.killSession()
 	}
+}
+
+// killSession hangs up the shell and ends the daemon shortly after (the
+// controller's FKill, or TKill on the control socket).
+func (d *Daemon) killSession() {
+	d.mu.Lock()
+	d.killed = true // refuse offers meanwhile: no shell is started for them
+	cmd, exited := d.cmd, d.exited
+	d.mu.Unlock()
+	if cmd != nil && cmd.Process != nil && !exited {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGHUP)
+		_ = cmd.Process.Signal(syscall.SIGHUP)
+	}
+	go func() {
+		time.Sleep(3 * time.Second)
+		d.stop()
+	}()
+}
+
+// dropPeers closes the peers of client instance cid (every peer if cid is
+// ""), including ones still connecting. Closing the peer connection ends its
+// data channels: the terminal and any stream channels on it. The client's
+// streams are killed rather than kept for a resume, also ones left detached
+// by a connection it replaced or lost.
+func (d *Daemon) dropPeers(cid string) {
+	d.mu.Lock()
+	var pcs []*webrtc.PeerConnection
+	n := 0
+	for p := range d.pending {
+		if cid == "" || p.cid == cid {
+			p.dropped = true
+			delete(d.pending, p)
+			n++
+			if p.pc != nil { // nil: handleOffer is creating it and sees dropped
+				pcs = append(pcs, p.pc)
+			}
+		}
+	}
+	for p := range d.peers {
+		if cid == "" || p.cid == cid {
+			p.dropped = true
+			p.open = false
+			delete(d.peers, p)
+			if d.ctrl == p {
+				d.ctrl = nil
+				d.ctrlGone = time.Now()
+			}
+			n++
+			pcs = append(pcs, p.pc)
+		}
+	}
+	var rs []*stream.Resumable
+	for c, owned := range d.owned {
+		if cid == "" || c == cid {
+			rs = append(rs, owned...)
+			delete(d.owned, c)
+		}
+	}
+	d.mu.Unlock()
+	if n > 0 || len(rs) > 0 {
+		log.Printf("dropping %d peer(s), %d stream(s) (cid %q)", n, len(rs), cid)
+	}
+	for _, pc := range pcs {
+		_ = pc.Close()
+	}
+	for _, r := range rs {
+		r.Kill()
+	}
+}
+
+// ownLocked records r as a stream of client instance cid (see owned) and
+// forgets streams that have finished (left the registry), so the lists stay
+// as long as the open streams (d.mu held).
+func (d *Daemon) ownLocked(cid string, r *stream.Resumable) {
+	for c, rs := range d.owned {
+		live := rs[:0]
+		for _, x := range rs {
+			if x != r && d.streams.Get(x.ID) == x {
+				live = append(live, x)
+			}
+		}
+		if len(live) == 0 {
+			delete(d.owned, c)
+		} else {
+			d.owned[c] = live
+		}
+	}
+	d.owned[cid] = append(d.owned[cid], r)
 }
 
 // --- streams --------------------------------------------------------------------
 
 // openToClient opens a stream from this host to the client.
 func (d *Daemon) openToClient(spec wire.StreamSpec) (*stream.Resumable, error) {
+	if d.opts.NoForward {
+		return nil, errNoForward
+	}
 	deadline := time.Now().Add(20 * time.Second)
 	for {
 		d.mu.Lock()
@@ -942,10 +1240,20 @@ func (d *Daemon) openToClient(spec wire.StreamSpec) (*stream.Resumable, error) {
 		d.mu.Unlock()
 		if p != nil && p.open {
 			r, err := stream.OpenResumable(p.pc, spec)
-			if err == nil {
-				d.streams.Add(r)
+			if err != nil {
+				return nil, err
 			}
-			return r, err
+			d.mu.Lock()
+			dropped := p.dropped
+			if !dropped {
+				d.streams.Add(r)
+				d.ownLocked(p.cid, r) // TDrop of this client ends it
+			}
+			d.mu.Unlock()
+			if !dropped {
+				return r, nil
+			}
+			r.Kill() // its client was dropped meanwhile: wait for the next one
 		}
 		if time.Now().After(deadline) {
 			return nil, errors.New("wosh client not connected")
@@ -957,6 +1265,11 @@ func (d *Daemon) openToClient(spec wire.StreamSpec) (*stream.Resumable, error) {
 // fromClient serves a stream the client opened: -L / -D forwards, which this
 // host dials (like ssh's direct-tcpip).
 func (d *Daemon) fromClient(ch stream.Conn, spec wire.StreamSpec) {
+	if d.opts.NoForward {
+		_ = ch.Send(stream.Err, []byte(errNoForward.Error()))
+		_ = ch.Close()
+		return
+	}
 	if spec.K != "tcp" || spec.Port <= 0 || spec.Port > 65535 {
 		_ = ch.Send(stream.Err, []byte("unsupported stream"))
 		_ = ch.Close()

@@ -182,9 +182,35 @@ func daemon(args []string) {
 		case "--own-binary":
 			i++
 			o.OwnBinary = args[i]
+		case "--ice-iface":
+			if i+1 >= len(args) {
+				fatal("--ice-iface needs interface names, e.g. tailscale0,lo")
+			}
+			i++
+			o.ICEInterfaces = iceIfaces(args[i])
+		case "--ring":
+			if i+1 >= len(args) {
+				fatal("--ring needs a size, e.g. 64M")
+			}
+			i++
+			n, err := server.ParseSize(args[i])
+			if err != nil {
+				fatal("bad --ring: %v", err)
+			}
+			o.RingSize = n
+		case "--no-forward":
+			o.NoForward = true
 		case "--":
 			o.Command = args[i+1:]
 			i = len(args)
+		default:
+			if v, ok := strings.CutPrefix(args[i], "--ice-iface="); ok {
+				o.ICEInterfaces = iceIfaces(v)
+				continue
+			}
+			// fail closed: a misspelled --no-forward must not start a
+			// daemon that forwards
+			fatal("_daemon: unknown argument %q", args[i])
 		}
 	}
 	o.ReadyFD = os.NewFile(3, "ready")
@@ -193,6 +219,16 @@ func daemon(args []string) {
 	if err := server.RunDaemon(o); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// iceIfaces parses an --ice-iface value. An empty list would silently lift
+// the limit, so it is an error.
+func iceIfaces(v string) []string {
+	l := rtc.SplitList(v)
+	if len(l) == 0 || strings.HasPrefix(v, "-") {
+		fatal("--ice-iface needs interface names, e.g. tailscale0,lo")
+	}
+	return l
 }
 
 func runClient(args []string) int {

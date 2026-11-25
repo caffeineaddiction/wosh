@@ -76,7 +76,10 @@ technique and may be flagged by EDR; `vm.memfd_noexec=2` disables it.
   and PTYs, so the same protocol works over `ssh -T` pipes and in-band
   through a running session's terminal.
 * **Daemon** (`wosh _daemon`, detached, one per session): owns the PTY,
-  keeps a 4 MiB output ring addressed by absolute offset, accepts offers on
+  keeps an output ring addressed by absolute offset (4 MiB by default. A
+  server that starts `wosh _daemon` itself can pass `--ring 64M` to keep
+  more scrollback for reconnects, up to 512M, at several times that in
+  memory. `wosh server` and `wosh up` always use 4 MiB), accepts offers on
   a unix socket (`$XDG_RUNTIME_DIR/wosh/ID.sock`, 0700), replaces the peer
   connection on every reconnect.
 * **Relays**: `wosh server` (initial, over ssh, exits after answering),
@@ -91,6 +94,12 @@ technique and may be flagged by EDR; `vm.memfd_noexec=2` disables it.
   output. An offer with `join` only takes control if nobody has it; a
   watcher asks for control with a `{"op":"take"}` control frame, and the
   daemon tells each peer its role (`{"op":"role","role":"control"|"view"}`).
+  Before any output, each peer gets `{"op":"info","out":N}`. N is how far
+  output has been sent to a controller, which answered the queries (DSR, DA)
+  in it. A new terminal replaying output below N should not answer them
+  again. Output nobody had control for, such as the shell's startup before
+  the first peer, stays above N. When N is 0 the daemon leaves `out` out of
+  the frame.
   When the controller is gone for 10 s, the longest watcher gets control.
   An offer with `watch` (and a cid) is a passive peer, such as wash's
   recorder: it always watches, is never promoted and cannot take control.
@@ -102,9 +111,30 @@ technique and may be flagged by EDR; `vm.memfd_noexec=2` disables it.
   removed, e.g. by a test or a logout without linger) can never be reached
   again; once no client is connected either, it hangs up the shell and exits
   after 5 s.
+* **Embedding**: a server that relays offers to the control socket (a
+  browser front end) can also cut peers off and end sessions there.
+  `{"t":"drop","cid":"X"}` closes client X's peers and ends its forwarded
+  connections. Without a cid it drops every peer. The session keeps running.
+  `{"t":"kill"}` hangs up the session and refuses new offers and starts
+  until the daemon exits. Both reply `{"t":"ok"}`.
+* **Headless sessions**: `{"t":"start","key":K,"term":T,"cols":C,"rows":R,"env":{},"src":S}`
+  on the control socket starts the shell before any peer connects, so
+  `type` works at once. Offers must then carry key K. The shell keeps the
+  start's term, env and src, and has no agent forwarding. It runs with no
+  peer until the shell exits. The 3-minute "no peer ever connected" limit
+  does not apply.
+  `{"t":"status"}` replies `{"t":"ok","status":{started, exited, exit_code,
+  ever_open, peers:[{cid, role: control|view|pending, passive}]}}`.
 * **Roaming**: 1 s pings (6 s timeout), ICE failure, or a local address
   disappearing trigger reconnect. Root sessions re-run ssh (`BatchMode`) with
   `attach`; nested sessions wait for their parent, then signal through it.
+* **Peeking at a session**: `{"t":"tail","n":65536}` on the control socket
+  returns the last n output bytes (default 64 KiB, at most 1 MiB) as
+  `{"t":"ok","data":"<base64>","off":<offset of the first byte>}`, without
+  connecting a peer. `data` and `off` are left out when empty or 0. The bytes
+  are raw output, so they may start inside a UTF-8 character or an escape
+  sequence. The reply line can reach about 1.4 MB. Daemons older than this op
+  send no reply, so read it with a timeout.
 
 ## Typing on slow links (predictive echo)
 
@@ -215,8 +245,17 @@ pair that then dies). wosh handles this:
 Debugging: `WOSH_SIM_DELAY=250ms` (client delays everything it receives,
 to try high-latency behaviour such as prediction on a fast link),
 `WOSH_DEBUG=1` (verbose pion logs), `WOSH_ICE_NET=udp4|udp6`
-(restrict candidates), `WOSH_KEEP_LOGS=1` (keep daemon logs); `~s` shows
+(restrict candidates), `WOSH_ICE_IFACES=lo,tailscale0` (gather candidates
+on these interfaces only, like `wosh _daemon --ice-iface`, and session
+shells inherit it), `WOSH_KEEP_LOGS=1` (keep daemon logs); `~s` shows
 the selected candidate pair.
+
+`wosh _daemon --ice-iface tailscale0,lo` keeps a daemon's ICE candidates,
+and the UDP sockets behind them, to the named interfaces: no LAN or
+container addresses in the answer. A loopback interface in the list also
+enables loopback candidates. The session shell gets the list as
+`WOSH_ICE_IFACES`. Each candidate appears twice in an answer (ICE
+components 1 and 2). Both lines name the same socket.
 
 ## Security notes
 
@@ -226,6 +265,12 @@ the selected candidate pair.
 * Any program printing to the terminal can emit a `hello`; the client
   therefore **asks** before upgrading (unless `--yes`) and only reacts to
   the foreground session.
+* Any peer of a session can open forwards. A watcher can dial with -L, and
+  the controller can listen with -R. A daemon started with
+  `wosh _daemon --no-forward` refuses every stream instead: no -L or -D
+  dials, no -R listeners, no agent socket, no src: transfers, and no wosh
+  builds fetched from the client for a chained hop. Use it when the
+  session is only a terminal, e.g. behind a browser front end.
 * STUN reveals your public IP to the STUN server; `--relay` forces TURN.
   TURN credentials given to the client are passed to the remote daemons.
 
